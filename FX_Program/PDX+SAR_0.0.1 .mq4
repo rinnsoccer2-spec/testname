@@ -8,7 +8,7 @@ input int Slippage = 10;
 // ■ ADX設定
 //=========================
 input int ADX_Period = 14;
-input double ADX_Threshold = 38.0;
+input double ADX_Threshold = 40.0;
 
 //=========================
 // ■ SAR設定
