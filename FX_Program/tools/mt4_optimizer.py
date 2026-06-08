@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-PDX+SAR 最適化スクリプト (MT4 Strategy Tester 直接実行版)
+MT4 EA パラメータ最適化スクリプト (Strategy Tester 直接実行版)
 
 使用方法:
-  python mt4_optimizer.py grid      # グリッドサーチ
-  python mt4_optimizer.py evolve    # 遺伝的アルゴリズム最適化
-  python mt4_optimizer.py refine    # ベストパラメータ周辺の絞り込み
-  python mt4_optimizer.py adaptive  # アダプティブストップ最適化
-  python mt4_optimizer.py atr       # ATRフィルター最適化
-  python mt4_optimizer.py backtest  # best_params.json で詳細バックテスト
+  python mt4_optimizer.py -o evolve   -k PDX+SAR_0.0.2   # 遺伝的アルゴリズム最適化
+  python mt4_optimizer.py -o grid     -k PDX+SAR_0.0.2   # グリッドサーチ
+  python mt4_optimizer.py -o refine   -k PDX+SAR_0.0.2   # ベストパラメータ周辺絞り込み
+  python mt4_optimizer.py -o adaptive -k PDX+SAR_0.0.2   # アダプティブストップ最適化
+  python mt4_optimizer.py -o atr      -k PDX+SAR_0.0.2   # ATRフィルター最適化
+  python mt4_optimizer.py -o backtest -k PDX+SAR_0.0.2   # best_params.json で詳細バックテスト
+
+  -k を省略した場合は EA_CONFIGS の先頭エントリを使用する。
+  新しい EA を追加するには EA_CONFIGS にエントリを追加すること。
 
 注意: 実行中は MT4 を手動で開かないこと（プロセス競合）。
 """
@@ -42,30 +45,52 @@ JPY_RATE = 150.0   # USD/JPY 近似レート
 FROM_DATE = datetime(2025, 6, 6)
 TO_DATE   = datetime(2026, 6, 5, 23, 59)
 
-# 最適化パラメータ空間
-GRID = {
-    "Lots":            [0.01],
-    "Slippage":        [10],
-    "ADX_Period":      [10, 14, 18],
-    "ADX_Threshold":   [30.0, 35.0, 40.0, 45.0],
-    "SAR_Step":        [0.01, 0.02, 0.03],
-    "SAR_Max":         [0.1, 0.2, 0.3],
-    "SAR_Min_Trend":   [2, 3, 4],
-    "StopLoss":        [200, 300, 333, 400, 500],
-    "TakeProfit":      [300, 500, 700, 1000],
-    "CooldownSeconds": [300, 600, 900],
+# ===== EA 設定レジストリ =====
+# 新しい EA を追加する場合はここにエントリを追加する。
+# キー名 = EA ファイル名から .ex4 を除いたもの。
+EA_CONFIGS: dict = {
+    "PDX+SAR_0.0.2": {
+        "grid": {
+            "Lots":            [0.01],
+            "Slippage":        [10],
+            "ADX_Period":      [10, 14, 18],
+            "ADX_Threshold":   [30.0, 35.0, 40.0, 45.0],
+            "SAR_Step":        [0.01, 0.02, 0.03],
+            "SAR_Max":         [0.1, 0.2, 0.3],
+            "SAR_Min_Trend":   [2, 3, 4],
+            "StopLoss":        [200, 300, 333, 400, 500],
+            "TakeProfit":      [300, 500, 700, 1000],
+            "CooldownSeconds": [300, 600, 900],
+        },
+        "int_params": {
+            'Slippage', 'ADX_Period', 'SAR_Min_Trend', 'CooldownSeconds',
+            'AdaptiveWindow', 'AdaptivePauseHours', 'ATR_Short', 'ATR_Baseline',
+        },
+    },
+    # 例: 別のEAを追加する場合
+    # "MyEA_1.0": {
+    #     "grid": {
+    #         "Lots": [0.01],
+    #         "MyParam": [10, 20, 30],
+    #     },
+    #     "int_params": {'MyIntParam'},
+    # },
 }
-MAX_SAMPLES = 100
+
+# 起動時デフォルト (-k で上書きされる)
+_DEFAULT_EA_KEY = next(iter(EA_CONFIGS))
+GRID            = EA_CONFIGS[_DEFAULT_EA_KEY]["grid"]
+MAX_SAMPLES     = 100
 
 # ===== MT4 テスター設定 =====
 MT4_EXE     = Path(r"C:\Program Files (x86)\XMTrading MT4\terminal.exe")
 TERM_INI    = MT4_DATA / "config" / "terminal.ini"
 TESTER_DIR  = MT4_DATA / "tester"
 REPORTS_DIR = MT4_DATA / "reports"
-EA_FILE     = "PDX+SAR_0.0.2.ex4"
+EA_FILE     = f"{_DEFAULT_EA_KEY}.ex4"
 RPT_NAME    = "py_opt_result"
 RPT_PATH    = REPORTS_DIR / f"{RPT_NAME}.htm"
-TESTER_INI  = TESTER_DIR / "PDX+SAR_0.0.2.ini"
+TESTER_INI  = TESTER_DIR / f"{_DEFAULT_EA_KEY}.ini"
 
 TESTER_FROM          = "2025.06.06"
 TESTER_TO            = "2026.06.05"
@@ -76,11 +101,8 @@ TESTER_MODEL_PRECISE = "1"     # コントロールポイント (Control Points)
 TESTER_SPREAD        = "current"
 TESTER_DEPOSIT       = 50000000  # 50M JPY: 残高不足を防ぐ
 
-# int 型として宣言されている EA パラメータ
-_INT_EA_PARAMS = {
-    'Slippage', 'ADX_Period', 'SAR_Min_Trend', 'CooldownSeconds',
-    'AdaptiveWindow', 'AdaptivePauseHours', 'ATR_Short', 'ATR_Baseline',
-}
+# int 型として宣言されている EA パラメータ (起動時デフォルト、-k で上書きされる)
+_INT_EA_PARAMS = EA_CONFIGS[_DEFAULT_EA_KEY]["int_params"]
 
 
 def log(msg: str):
@@ -911,6 +933,112 @@ def _dump_mt4_controls(app):
             log(f'[MT4 dump error] {e}')
 
 
+_TESTER_TOGGLE_CMD: int = 0  # Strategy Tester トグルのメニューコマンドID (0=未取得)
+
+
+def _find_tester_toggle_cmd(hwnd: int) -> int:
+    """MT4 メニューから Strategy Tester のコマンドIDを探して返す (0=見つからず)"""
+    import win32gui, win32con
+    try:
+        menu = win32gui.GetMenu(hwnd)
+        if not menu:
+            log('[MT4] GetMenu()=NULL (カスタムメニューのため WM_KEYDOWN 方式を使用)')
+            return 0
+        for i in range(win32gui.GetMenuItemCount(menu)):
+            sub = win32gui.GetSubMenu(menu, i)
+            if not sub:
+                continue
+            for j in range(win32gui.GetMenuItemCount(sub)):
+                try:
+                    cmd_id = win32gui.GetMenuItemID(sub, j)
+                    if cmd_id <= 0:
+                        continue
+                    text = win32gui.GetMenuString(sub, j, win32con.MF_BYPOSITION)
+                    if any(kw in text for kw in ('テスター', 'Tester', 'tester', 'Strategy')):
+                        log(f'[MT4] Strategy Tester メニューID: {cmd_id}  ("{text}")')
+                        return cmd_id
+                except Exception:
+                    pass
+        log('[MT4] Strategy Tester メニュー項目が見つからず → WM_KEYDOWN 方式を使用')
+    except Exception as e:
+        log(f'[MT4] メニュー探索エラー: {e}')
+    return 0
+
+
+def _toggle_tester_bg(app) -> bool:
+    """フォーカスを最小限に抑えて Strategy Tester を開閉する。
+
+    優先順位:
+      1. WM_COMMAND (メニューコマンドID) — フォーカス不要
+      2. AttachThreadInput + keybd_event (Ctrl+R)
+         keybd_event は GetKeyState を更新するため MT4 が確実に Ctrl+R と認識する。
+         前面切替は ~50ms のみ。
+      3. set_focus + type_keys — 最終フォールバック (フォーカス奪取あり)
+    """
+    global _TESTER_TOGGLE_CMD
+    import win32gui, win32con, win32api, win32process, ctypes, time
+
+    hwnd = app.top_window().handle
+
+    # 方法1: WM_COMMAND (メニューコマンドID)
+    if _TESTER_TOGGLE_CMD == 0:
+        _TESTER_TOGGLE_CMD = _find_tester_toggle_cmd(hwnd)
+
+    if _TESTER_TOGGLE_CMD != 0:
+        win32gui.PostMessage(hwnd, win32con.WM_COMMAND, _TESTER_TOGGLE_CMD, 0)
+        log(f'[MT4] テスタートグル: WM_COMMAND (id={_TESTER_TOGGLE_CMD})')
+        return True
+
+    # 方法2: AttachThreadInput + keybd_event
+    # PostMessage(WM_KEYDOWN) は GetKeyState を更新しないため Ctrl+R が届かない。
+    # keybd_event はカーネルレベルで GetKeyState を更新するため確実。
+    try:
+        KEYEVENTF_KEYUP = 0x0002
+        VK_R = 0x52
+
+        prev_hwnd  = win32gui.GetForegroundWindow()
+        our_tid    = ctypes.windll.kernel32.GetCurrentThreadId()
+        target_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
+
+        # 入力スレッドをアタッチ → SetForegroundWindow が確実に動作する
+        attached = False
+        if our_tid != target_tid:
+            attached = bool(ctypes.windll.user32.AttachThreadInput(our_tid, target_tid, True))
+
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.05)
+
+        # Ctrl+R を keybd_event で送信 (GetKeyState が "押下中" になる)
+        win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+        win32api.keybd_event(VK_R, 0, 0, 0)
+        win32api.keybd_event(VK_R, 0, KEYEVENTF_KEYUP, 0)
+        win32api.keybd_event(win32con.VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        time.sleep(0.05)
+
+        if attached:
+            ctypes.windll.user32.AttachThreadInput(our_tid, target_tid, False)
+
+        # 直前のウィンドウをフォアグラウンドに戻す
+        if prev_hwnd and prev_hwnd != hwnd and win32gui.IsWindow(prev_hwnd):
+            win32gui.SetForegroundWindow(prev_hwnd)
+
+        log('[MT4] テスタートグル: AttachThreadInput + keybd_event (Ctrl+R)')
+        return True
+    except Exception as e:
+        log(f'[MT4] keybd_event 失敗: {e}')
+
+    # 方法3: 最終フォールバック (フォーカスを奪う)
+    log('[MT4] テスタートグル: フォールバック set_focus + type_keys')
+    try:
+        app.top_window().set_focus()
+        time.sleep(0.2)
+        app.top_window().type_keys('^r')
+        return True
+    except Exception as e:
+        log(f'[MT4] テスタートグル失敗: {e}')
+        return False
+
+
 def _launch_mt4_session(model: str = TESTER_MODEL_FAST):
     """MT4 を起動してテスター UI の初期設定（期間・モデル・日付）を行い (proc, app) を返す。
 
@@ -919,6 +1047,7 @@ def _launch_mt4_session(model: str = TESTER_MODEL_FAST):
     import time
     from pywinauto import Application, Desktop
 
+    _prevent_sleep()
     _update_tester_config(model)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1007,22 +1136,31 @@ def _run_single_test(app, params: dict) -> dict:
     # 1. EA ini を書き込む
     _write_ea_ini(params)
 
-    # 2. Ctrl+R でテスターを閉じ→再開 (ini 再読み込みトリガー)
+    # 2. テスターを閉じ→再開 (ini 再読み込みトリガー)
+    #    MT4 は ini を「テスターパネルを開くとき」に読み込む。
+    #    確実に閉じたことを確認してから開く。
     try:
-        app.top_window().set_focus()
-        time.sleep(0.3)
-
         # テスターが開いていれば先に閉じる
         if _collect_tester_controls(app)['start'] is not None:
-            app.top_window().type_keys('^r')
-            log('[MT4] テスター閉じる (Ctrl+R)')
-            time.sleep(1.5)
+            _toggle_tester_bg(app)
+            log('[MT4] テスター閉じる')
+            # 実際に閉じたか確認 (最大 3 秒)
+            for _chk in range(6):
+                time.sleep(0.5)
+                if _collect_tester_controls(app)['start'] is None:
+                    log('[MT4] テスター閉じる確認')
+                    break
+            else:
+                # トグルが効いていない → set_focus フォールバックで確実に閉じる
+                log('[警告] テスターが閉じない → set_focus フォールバックで強制閉じ')
+                app.top_window().set_focus()
+                time.sleep(0.2)
+                app.top_window().type_keys('^r')
+                time.sleep(1.5)
 
         # テスターを開く (ini 再読み込み)
-        app.top_window().set_focus()
-        time.sleep(0.2)
-        app.top_window().type_keys('^r')
-        log('[MT4] テスター開く (Ctrl+R) → ini 再読み込み')
+        _toggle_tester_bg(app)
+        log('[MT4] テスター開く → ini 再読み込み')
         time.sleep(3.5)
     except Exception as e:
         log(f'[MT4] テスター再起動スキップ: {e}')
@@ -1111,8 +1249,28 @@ def _run_single_test(app, params: dict) -> dict:
     return metrics
 
 
+def _prevent_sleep():
+    """最適化中にディスプレイスリープ・システムスリープを抑制する"""
+    import ctypes
+    ES_CONTINUOUS       = 0x80000000
+    ES_SYSTEM_REQUIRED  = 0x00000001  # システムスリープ抑制
+    ES_DISPLAY_REQUIRED = 0x00000002  # ディスプレイオフ抑制
+    ctypes.windll.kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+    log('[MT4] スリープ抑制: ON (ディスプレイ・システムスリープを無効化)')
+
+
+def _restore_sleep():
+    """スリープ抑制を解除してOSのデフォルト設定に戻す"""
+    import ctypes
+    ES_CONTINUOUS = 0x80000000
+    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+    log('[MT4] スリープ抑制: OFF (OS デフォルトに戻す)')
+
+
 def _close_mt4(proc) -> None:
     """MT4 プロセスを安全に終了する"""
+    _restore_sleep()
     if proc.poll() is None:
         try:
             proc.terminate()
@@ -1171,11 +1329,13 @@ def _ind_key(ind: dict) -> tuple:
 def _run_evolve(grid: dict, label: str,
                 evaluator=None,
                 n_gen: int = GA_N_GEN, pop_size: int = GA_POP_SIZE,
-                patience: int = GA_PATIENCE) -> list:
+                patience: int = GA_PATIENCE,
+                seed_results: list = None) -> list:
     """GA の共通ループ。grid で探索空間を指定し、結果リストを返す。
 
-    evaluator: params -> dict の評価関数。None の場合は run_mt4_backtest を使う。
-    セッション共有する場合は lambda p: _run_single_test(app, p) を渡す。
+    evaluator:    params -> dict の評価関数。None の場合は run_mt4_backtest を使う。
+    seed_results: チェックポイントから読み込んだ評価済み結果リスト。
+                  渡すとキャッシュに引き継ぎ、上位個体を初期集団の種に使う。
     """
     if evaluator is None:
         evaluator = run_mt4_backtest
@@ -1189,11 +1349,24 @@ def _run_evolve(grid: dict, label: str,
         f'エリート={elite_n}  交叉={n_cross}  ランダム={n_random}  '
         f'突然変異率={GA_MUT_RATE}  early_stop_patience={patience}')
 
-    population    = [_random_individual(grid) for _ in range(pop_size)]
+    # チェックポイントがあればキャッシュと初期集団を復元
     cache: dict   = {}
     all_results: list = []
-    best_pf       = -1.0
-    no_improve    = 0
+    if seed_results:
+        for r in seed_results:
+            if 'params' in r:
+                cache[_ind_key(r['params'])] = r
+        all_results = list(seed_results)
+        # 上位 elite_n 体を初期集団の種に、残りはランダムで多様性を確保
+        sorted_seeds = sorted(seed_results, key=lambda x: x.get('profit_factor') or 0, reverse=True)
+        seed_inds    = [r['params'] for r in sorted_seeds[:elite_n]]
+        population   = seed_inds + [_random_individual(grid) for _ in range(pop_size - len(seed_inds))]
+        log(f'チェックポイント引き継ぎ: 評価済み {len(cache)} 件 / 初期種 {len(seed_inds)} 体')
+    else:
+        population = [_random_individual(grid) for _ in range(pop_size)]
+
+    best_pf    = -1.0
+    no_improve = 0
 
     for gen in range(1, n_gen + 1):
 
@@ -1228,6 +1401,27 @@ def _run_evolve(grid: dict, label: str,
 
         all_results.extend([s[1] for s in scored])
 
+        # --- チェックポイント保存 (中断してもここまでの最善が残る) ---
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        # best_params.json を毎世代上書き
+        best_params_path = RESULTS_DIR / 'best_params.json'
+        best_params_path.write_text(
+            json.dumps(scored[0][2], ensure_ascii=False, indent=2),
+            encoding='utf-8')
+        # ユニーク結果のチェックポイントを保存
+        ckpt_seen: set   = set()
+        ckpt_unique: list = []
+        for r in all_results:
+            k = _ind_key(r['params'])
+            if k not in ckpt_seen:
+                ckpt_seen.add(k)
+                ckpt_unique.append(r)
+        ckpt_unique.sort(key=lambda x: x.get('profit_factor') or 0, reverse=True)
+        ckpt_path = RESULTS_DIR / f'{label}_checkpoint.json'
+        ckpt_path.write_text(
+            json.dumps(ckpt_unique, ensure_ascii=False, indent=2, default=str),
+            encoding='utf-8')
+
         if gen == n_gen:
             log(f'[{label}] 最大世代数 ({n_gen}) に到達。終了。')
             break
@@ -1261,11 +1455,27 @@ def _run_evolve(grid: dict, label: str,
 
 
 def cmd_evolve():
-    """遺伝的アルゴリズムでパラメータ最適化する（全グリッド対象）"""
+    """遺伝的アルゴリズムでパラメータ最適化する（全グリッド対象）
+
+    evolve_checkpoint.json が存在する場合は自動的に引き継いで続きから再開する。
+    最初からやり直したい場合は evolve_checkpoint.json を削除してから実行すること。
+    """
+    # チェックポイントがあれば引き継ぐ
+    ckpt_path    = RESULTS_DIR / 'evolve_checkpoint.json'
+    seed_results = None
+    if ckpt_path.exists():
+        try:
+            seed_results = json.loads(ckpt_path.read_text(encoding='utf-8'))
+            log(f'チェックポイント検出: {len(seed_results)} 件を引き継いで再開します')
+            log(f'  (最初からやり直す場合は {ckpt_path} を削除してください)')
+        except Exception as e:
+            log(f'チェックポイント読み込みスキップ: {e}')
+
     proc, app = _launch_mt4_session(TESTER_MODEL_FAST)
     try:
         evaluator = lambda p: _run_single_test(app, p)
-        unique = _run_evolve(GRID, label='evolve', evaluator=evaluator)
+        unique = _run_evolve(GRID, label='evolve', evaluator=evaluator,
+                             seed_results=seed_results)
     finally:
         _close_mt4(proc)
 
@@ -1506,6 +1716,30 @@ def cmd_atr():
     save_results(results, 'atr_results')
 
 
+# ===== EA 切り替え =====
+
+def _apply_ea_config(key: str):
+    """EA キーに対応する設定をモジュールグローバルに適用する。"""
+    global EA_FILE, TESTER_INI, GRID, _INT_EA_PARAMS, RESULTS_DIR
+
+    if key not in EA_CONFIGS:
+        available = ', '.join(EA_CONFIGS.keys())
+        print(f'[エラー] EA キー "{key}" が EA_CONFIGS に定義されていません。\n'
+              f'  利用可能: {available}\n'
+              f'  EA_CONFIGS に新しいエントリを追加してから再実行してください。')
+        sys.exit(1)
+
+    cfg            = EA_CONFIGS[key]
+    EA_FILE        = f'{key}.ex4'
+    TESTER_INI     = TESTER_DIR / f'{key}.ini'
+    GRID           = cfg['grid']
+    _INT_EA_PARAMS = cfg['int_params']
+    RESULTS_DIR    = Path(__file__).parent / 'results' / key
+    log(f'EA 設定適用: {key}  '
+        f'({len(GRID)} パラメータ / '
+        f'結果保存先: {RESULTS_DIR})')
+
+
 # ===== コマンド =====
 
 def cmd_grid():
@@ -1578,20 +1812,43 @@ def cmd_backtest():
 # ===== エントリーポイント =====
 
 if __name__ == '__main__':
-    mode = sys.argv[1] if len(sys.argv) > 1 else 'evolve'
+    import argparse
 
-    if mode == 'grid':
+    _ops = ['grid', 'evolve', 'refine', 'adaptive', 'atr', 'backtest']
+    parser = argparse.ArgumentParser(
+        description='MT4 EA パラメータ最適化',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            '使用例:\n'
+            '  python mt4_optimizer.py -o evolve -k PDX+SAR_0.0.2\n'
+            '  python mt4_optimizer.py -o grid   -k PDX+SAR_0.0.2\n'
+            f'  利用可能な EA キー: {", ".join(EA_CONFIGS.keys())}'
+        ),
+    )
+    parser.add_argument(
+        '-o', '--operation',
+        default='evolve',
+        choices=_ops,
+        help='実行モード (デフォルト: evolve)',
+    )
+    parser.add_argument(
+        '-k', '--key',
+        default=_DEFAULT_EA_KEY,
+        help=f'EA キー名 (拡張子なし, デフォルト: {_DEFAULT_EA_KEY})',
+    )
+    args = parser.parse_args()
+
+    _apply_ea_config(args.key)
+
+    if args.operation == 'grid':
         cmd_grid()
-    elif mode == 'evolve':
+    elif args.operation == 'evolve':
         cmd_evolve()
-    elif mode == 'refine':
+    elif args.operation == 'refine':
         cmd_refine()
-    elif mode == 'adaptive':
+    elif args.operation == 'adaptive':
         cmd_adaptive()
-    elif mode == 'atr':
+    elif args.operation == 'atr':
         cmd_atr()
-    elif mode == 'backtest':
+    elif args.operation == 'backtest':
         cmd_backtest()
-    else:
-        print('使用方法: python mt4_optimizer.py [grid|evolve|refine|adaptive|backtest]')
-        sys.exit(1)
