@@ -1,0 +1,24 @@
+{
+  "int_params": [
+    "Slippage",
+    "ADX_Period",
+    "SAR_Min_Trend",
+    "CooldownSeconds",
+    "AdaptiveWindow",
+    "AdaptivePauseHours",
+    "ATR_Short",
+    "ATR_Baseline"
+  ],
+  "grid": {
+    "Lots":            [0.01],
+    "Slippage":        [10],
+    "ADX_Period":      [10, 14, 18],
+    "ADX_Threshold":   [30.0, 35.0, 40.0, 45.0],
+    "SAR_Step":        [0.01, 0.02, 0.03],
+    "SAR_Max":         [0.1, 0.2, 0.3],
+    "SAR_Min_Trend":   [2, 3, 4],
+    "StopLoss":        [200, 300, 333, 400, 500],
+    "TakeProfit":      [300, 500, 700, 1000],
+    "CooldownSeconds": [300, 600, 900]
+  }
+}
