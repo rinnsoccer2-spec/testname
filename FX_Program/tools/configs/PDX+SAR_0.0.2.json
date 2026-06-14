@@ -1,4 +1,6 @@
 {
+  "symbol": "GOLD",
+  "period": "15",
   "int_params": [
     "Slippage",
     "ADX_Period",

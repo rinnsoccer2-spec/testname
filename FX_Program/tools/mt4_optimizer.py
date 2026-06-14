@@ -36,14 +36,6 @@ MT4_DATA    = Path(r"C:\Users\rinns\AppData\Roaming\MetaQuotes\Terminal\082F53F5
 HST_PATH    = MT4_DATA / "history" / "XMTrading-Demo 6" / "GOLD15.hst"
 RESULTS_DIR = Path(__file__).parent / "results"
 
-# ===== 定数 =====
-POINT    = 0.01    # GOLD の 1 point = $0.01
-SPREAD   = 20      # スプレッド近似: 20 points = $0.20
-LOT_SIZE = 100     # 1 lot = 100 oz
-JPY_RATE = 150.0   # USD/JPY 近似レート
-
-FROM_DATE = datetime(2025, 6, 6)
-TO_DATE   = datetime(2026, 6, 5, 23, 59)
 
 # ===== EA 設定ファイル =====
 # EA ごとの設定は tools/configs/<EA名>.json に記述する。
@@ -56,6 +48,10 @@ GRID: dict           = {}
 _INT_EA_PARAMS: set  = set()
 MAX_SAMPLES          = 100
 
+# ===== 評価スコア重み =====
+SCORE_WEIGHT_NET_PROFIT   = 0.7  # 純益の重み
+SCORE_WEIGHT_TOTAL_TRADES = 0.3  # 総トレード数の重み
+
 # ===== MT4 テスター設定 =====
 MT4_EXE     = Path(r"C:\Program Files (x86)\XMTrading MT4\terminal.exe")
 TERM_INI    = MT4_DATA / "config" / "terminal.ini"
@@ -66,7 +62,7 @@ RPT_NAME    = "py_opt_result"
 RPT_PATH    = REPORTS_DIR / f"{RPT_NAME}.htm"
 TESTER_INI  = TESTER_DIR / f"{_DEFAULT_EA_KEY}.ini"
 
-TESTER_FROM          = "2025.06.06"
+TESTER_FROM          = "2023.06.06"
 TESTER_TO            = "2026.06.05"
 TESTER_SYMBOL        = "GOLD"
 TESTER_PERIOD        = "15"    # M15
@@ -74,6 +70,9 @@ TESTER_MODEL_FAST    = "2"     # 始値のみ (Open Prices Only): 2-6秒/回 (GA
 TESTER_MODEL_PRECISE = "1"     # コントロールポイント (Control Points): 最終検証用
 TESTER_SPREAD        = "current"
 TESTER_DEPOSIT       = 50000000  # 50M JPY: 残高不足を防ぐ
+
+# M5=1, M15=2, M30=3, H1=4, H4=5 (MT4 テスター Period コンボボックスのインデックス)
+PERIOD_INDEX_MAP = {'1': 0, '5': 1, '15': 2, '30': 3, '60': 4, '240': 5, '1440': 6}
 
 
 
@@ -472,13 +471,29 @@ def print_report(data: dict, params: dict = None):
     print(f"  プロフィットF     : {data.get('profit_factor', 'N/A')}")
     print(f"  最大ドローダウン  : {data.get('max_drawdown', 'N/A'):>10} JPY")
     print(f"  総トレード数      : {data.get('total_trades', 'N/A')}")
+
+    # 月平均取引数: monthly_trades があればそこから、なければ期間で割る
+    monthly = data.get('monthly_trades', {})
+    if monthly:
+        avg_monthly = sum(monthly.values()) / len(monthly)
+    else:
+        try:
+            tf = datetime.strptime(TESTER_FROM, '%Y.%m.%d')
+            tt = datetime.strptime(TESTER_TO,   '%Y.%m.%d')
+            n_months = (tt.year - tf.year) * 12 + (tt.month - tf.month) + 1
+            avg_monthly = (data.get('total_trades', 0) or 0) / n_months if n_months > 0 else None
+        except Exception:
+            avg_monthly = None
+    if avg_monthly is not None:
+        print(f"  月平均取引数      : {avg_monthly:>10.1f} 回/月")
+
     print(f"  勝率              : {data.get('win_rate_pct', 'N/A')}%")
     print(f"  平均勝ち          : {data.get('avg_win', 'N/A'):>10} JPY")
     print(f"  平均負け          : {data.get('avg_loss', 'N/A'):>10} JPY")
 
-    if data.get('monthly_trades'):
+    if monthly:
         print('\n【月次取引数】')
-        for month, count in data['monthly_trades'].items():
+        for month, count in monthly.items():
             print(f'  {month}  :  {count:3d} 回')
 
     if data.get('consec_loss_start_hour_dist'):
@@ -502,8 +517,9 @@ def save_results(results: list, prefix: str) -> Path:
     if results:
         csv_path   = RESULTS_DIR / f'{prefix}_{ts}.csv'
         param_keys = list(results[0]['params'].keys())
-        met_keys   = ['net_profit', 'profit_factor', 'max_drawdown', 'total_trades',
-                      'win_rate_pct', 'avg_win', 'avg_loss', 'longest_consec_loss_count']
+        met_keys   = ['composite_score', 'net_profit', 'profit_factor', 'max_drawdown',
+                      'total_trades', 'win_rate_pct', 'avg_win', 'avg_loss',
+                      'longest_consec_loss_count']
         with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
             w = csv.DictWriter(f, fieldnames=['rank'] + met_keys + param_keys,
                                extrasaction='ignore')
@@ -575,7 +591,7 @@ def _update_tester_config(model: str = TESTER_MODEL_FAST):
         'Optimization=0\n'
         f'Report={RPT_NAME}\n'
         'ReplaceReport=1\n'
-        'ShutdownTerminal=1\n'
+        'ShutdownTerminal=0\n'
         'VisualChart=0\n'
         f'Spread={TESTER_SPREAD}\n'
     )
@@ -655,74 +671,18 @@ def _parse_mt4_report() -> dict:
     }
 
 
-def _parse_tester_log(log_path: Path, size_before: int) -> dict:
-    """テスターログの追加分を解析してメトリクスを返す
 
-    HTMLレポートに依存しないため ShutdownTerminal=1 が不要。
-    各トレードの open/close/SL/TP エントリから損益を計算する。
+def _cb_select(ctrl, index: int) -> None:
+    """ComboBox を SendMessage(CB_SETCURSEL) で直接選択する。
+
+    pywinauto の select() は 64-bit Python + 32-bit MT4 の組み合わせで失敗するため、
+    Win32 メッセージを直接送って回避する。
     """
-    import re
-
-    if not log_path.exists():
-        return {}
-
-    with open(log_path, 'rb') as f:
-        f.seek(size_before)
-        new_text = f.read().decode('utf-8', errors='replace')
-
-    if not new_text.strip():
-        return {}
-
-    orders: dict = {}   # ticket -> {type, lots, entry}
-    profits_jpy: list = []
-
-    # open #N buy/sell LOTS SYMBOL at PRICE sl: SL tp: TP ok
-    open_pat  = re.compile(r'open #(\d+) (buy|sell) ([\d.]+) \S+ at ([\d.]+)')
-    # close #N ... at price PRICE  (SAR 決済)
-    close_pat = re.compile(r'close #(\d+) .+? at price ([\d.]+)')
-    # stop loss #N at PRICE / take profit #N at PRICE
-    sltp_pat  = re.compile(r'(?:stop loss|take profit) #(\d+) at ([\d.]+)')
-
-    for line in new_text.splitlines():
-        m = open_pat.search(line)
-        if m:
-            orders[int(m.group(1))] = {
-                'type': m.group(2), 'lots': float(m.group(3)), 'entry': float(m.group(4))
-            }
-            continue
-        for pat in (close_pat, sltp_pat):
-            m = pat.search(line)
-            if m:
-                ticket = int(m.group(1))
-                if ticket in orders:
-                    o       = orders.pop(ticket)
-                    diff    = (float(m.group(2)) - o['entry']) if o['type'] == 'buy' \
-                              else (o['entry'] - float(m.group(2)))
-                    profits_jpy.append(diff * o['lots'] * LOT_SIZE * JPY_RATE)
-                break
-
-    if not profits_jpy:
-        return {}
-
-    wins   = [p for p in profits_jpy if p > 0]
-    losses = [p for p in profits_jpy if p < 0]
-    gw     = sum(wins)        if wins   else 0.0
-    gl     = abs(sum(losses)) if losses else 0.0
-    pf     = gw / gl if gl > 0 else 9999.0
-
-    equity = np.cumsum([0.0] + profits_jpy)
-    peak   = np.maximum.accumulate(equity)
-    max_dd = float(np.max(peak - equity))
-
-    return {
-        'profit_factor': round(pf, 4),
-        'net_profit':    round(gw - gl, 0),
-        'max_drawdown':  round(max_dd, 0),
-        'total_trades':  len(profits_jpy),
-        'win_rate_pct':  round(len(wins) / len(profits_jpy) * 100, 2),
-        'avg_win':       round(gw / len(wins)         if wins   else 0, 0),
-        'avg_loss':      round(sum(losses) / len(losses) if losses else 0, 0),
-    }
+    import win32gui
+    CB_SETCURSEL = 0x014E
+    result = win32gui.SendMessage(ctrl.handle, CB_SETCURSEL, index, 0)
+    if result == -1:
+        raise RuntimeError(f'CB_SETCURSEL index={index} failed (CB_ERR)')
 
 
 def _collect_tester_controls(app) -> dict:
@@ -735,6 +695,11 @@ def _collect_tester_controls(app) -> dict:
         'date_start': None,   # SysDateTimePick32 開始日
         'date_end':   None,   # SysDateTimePick32 終了日
     }
+    # Period ComboBox に表示されうる文字列（表示中の期間名 or 空文字）
+    _PERIOD_STRS = frozenset({
+        'M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1', 'MN', '',
+        '1', '5', '15', '30', '60', '240', '1440',
+    })
     # テスターパネル配下のみ対象とするため "テスター" パネルを先に探す
     tester_root = [None]
 
@@ -779,7 +744,7 @@ def _collect_tester_controls(app) -> dict:
                             found['model'] = child
                         elif EA_FILE.replace('.ex4', '') in text and found['expert'] is None:
                             found['expert'] = child
-                        elif text == '' and found['period'] is None:
+                        elif text in _PERIOD_STRS and found['period'] is None:
                             found['period'] = child
                     elif cls == 'SysDateTimePick32':
                         date_picks.append(child)
@@ -812,8 +777,7 @@ def _configure_and_start_tester(app, model: str) -> bool:
     import win32con
     import time
 
-    # M15 = インデックス 2 (M1=0, M5=1, M15=2, M30=3, H1=4, H4=5 ...)
-    PERIOD_INDEX = 2
+    PERIOD_INDEX = PERIOD_INDEX_MAP.get(TESTER_PERIOD, 2)
 
     # モデル: terminal.ini の Model= 値をそのまま ComboBox インデックスとして使う
     try:
@@ -832,19 +796,19 @@ def _configure_and_start_tester(app, model: str) -> bool:
     if ctrl['start'] is None:
         return False
 
-    # 期間を M15 に設定
+    # 期間を設定
     if ctrl['period'] is not None:
         try:
-            ctrl['period'].select(PERIOD_INDEX)
+            _cb_select(ctrl['period'], PERIOD_INDEX)
             time.sleep(0.3)
-            log(f'[MT4] 期間設定: インデックス {PERIOD_INDEX} (M15)')
+            log(f'[MT4] 期間設定: インデックス {PERIOD_INDEX}')
         except Exception as e:
             log(f'[MT4] 期間設定スキップ: {e}')
 
     # モデルを設定
     if ctrl['model'] is not None:
         try:
-            ctrl['model'].select(model_index)
+            _cb_select(ctrl['model'], model_index)
             time.sleep(0.3)
             log(f'[MT4] モデル設定: インデックス {model_index}')
         except Exception as e:
@@ -973,26 +937,36 @@ def _toggle_tester_bg(app) -> bool:
         target_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
 
         # 入力スレッドをアタッチ → SetForegroundWindow が確実に動作する
-        attached = False
+        # フォアグラウンドスレッドと MT4 スレッドの両方にアタッチする。
+        # SetForegroundWindow の呼び出し権限はフォアグラウンドスレッドへの
+        # AttachThreadInput によって得られるため、両方が必要。
+        fg_tid       = win32process.GetWindowThreadProcessId(prev_hwnd)[0] if prev_hwnd else 0
+        attached_fg  = False
+        attached_tgt = False
+        if our_tid != fg_tid and fg_tid:
+            attached_fg  = bool(ctypes.windll.user32.AttachThreadInput(our_tid, fg_tid, True))
         if our_tid != target_tid:
-            attached = bool(ctypes.windll.user32.AttachThreadInput(our_tid, target_tid, True))
+            attached_tgt = bool(ctypes.windll.user32.AttachThreadInput(our_tid, target_tid, True))
 
         win32gui.SetForegroundWindow(hwnd)
-        time.sleep(0.05)
+        time.sleep(0.08)
 
         # Ctrl+R を keybd_event で送信 (GetKeyState が "押下中" になる)
         win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
         win32api.keybd_event(VK_R, 0, 0, 0)
         win32api.keybd_event(VK_R, 0, KEYEVENTF_KEYUP, 0)
         win32api.keybd_event(win32con.VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(0.05)
+        time.sleep(0.08)
 
-        if attached:
-            ctypes.windll.user32.AttachThreadInput(our_tid, target_tid, False)
-
-        # 直前のウィンドウをフォアグラウンドに戻す
+        # 直前のウィンドウをフォアグラウンドに戻す (AttachThreadInput が有効な間に実行)
         if prev_hwnd and prev_hwnd != hwnd and win32gui.IsWindow(prev_hwnd):
             win32gui.SetForegroundWindow(prev_hwnd)
+        time.sleep(0.05)
+
+        if attached_fg:
+            ctypes.windll.user32.AttachThreadInput(our_tid, fg_tid, False)
+        if attached_tgt:
+            ctypes.windll.user32.AttachThreadInput(our_tid, target_tid, False)
 
         log('[MT4] テスタートグル: AttachThreadInput + keybd_event (Ctrl+R)')
         return True
@@ -1002,9 +976,11 @@ def _toggle_tester_bg(app) -> bool:
     # 方法3: 最終フォールバック (フォーカスを奪う)
     log('[MT4] テスタートグル: フォールバック set_focus + type_keys')
     try:
+        _prev_fg_m3 = win32gui.GetForegroundWindow()
         app.top_window().set_focus()
         time.sleep(0.2)
         app.top_window().type_keys('^r')
+        _restore_fg(_prev_fg_m3)
         return True
     except Exception as e:
         log(f'[MT4] テスタートグル失敗: {e}')
@@ -1051,12 +1027,15 @@ def _launch_mt4_session(model: str = TESTER_MODEL_FAST):
         raise RuntimeError('MT4 ウィンドウが見つかりません（起動タイムアウト）')
 
     time.sleep(15)
+    import win32gui, win32con
+    _prev_fg_init = win32gui.GetForegroundWindow()
     app.top_window().set_focus()
-    time.sleep(1)
+    time.sleep(0.3)
+    _restore_fg(_prev_fg_init)
+    time.sleep(0.5)
 
     # 期間・モデル・日付を設定（Startは押さない）
-    import win32gui, win32con
-    PERIOD_INDEX = 2  # M15
+    PERIOD_INDEX = PERIOD_INDEX_MAP.get(TESTER_PERIOD, 2)
     try:
         model_index = int(model)
     except ValueError:
@@ -1073,8 +1052,8 @@ def _launch_mt4_session(model: str = TESTER_MODEL_FAST):
         raise RuntimeError('テスターパネルが見つかりません')
 
     for key, fn in [
-        ('period',     lambda: ctrl['period'].select(PERIOD_INDEX)),
-        ('model',      lambda: ctrl['model'].select(model_index)),
+        ('period',     lambda: _cb_select(ctrl['period'], PERIOD_INDEX)),
+        ('model',      lambda: _cb_select(ctrl['model'],  model_index)),
         ('date_start', lambda: ctrl['date_start'].set_time(
             year=int(TESTER_FROM[:4]), month=int(TESTER_FROM[5:7]), day=int(TESTER_FROM[8:10]))),
         ('date_end',   lambda: ctrl['date_end'].set_time(
@@ -1089,6 +1068,31 @@ def _launch_mt4_session(model: str = TESTER_MODEL_FAST):
 
     log('[MT4] セッション準備完了')
     return proc, app
+
+
+def _restore_fg(saved_hwnd: int) -> None:
+    """MT4 がフォアグラウンドを奪った後、saved_hwnd (ユーザーの作業ウインドウ) に戻す。
+
+    現フォアグラウンドのスレッドに AttachThreadInput することで
+    SetForegroundWindow の呼び出し権限を取得してから復元する。
+    """
+    import ctypes, win32gui, win32process
+    if not saved_hwnd or not win32gui.IsWindow(saved_hwnd):
+        return
+    cur = win32gui.GetForegroundWindow()
+    if cur == saved_hwnd:
+        return
+    try:
+        our_tid  = ctypes.windll.kernel32.GetCurrentThreadId()
+        cur_tid  = win32process.GetWindowThreadProcessId(cur)[0] if cur else 0
+        attached = False
+        if our_tid != cur_tid and cur_tid:
+            attached = bool(ctypes.windll.user32.AttachThreadInput(our_tid, cur_tid, True))
+        win32gui.SetForegroundWindow(saved_hwnd)
+        if attached:
+            ctypes.windll.user32.AttachThreadInput(our_tid, cur_tid, False)
+    except Exception:
+        pass
 
 
 def _run_single_test(app, params: dict) -> dict:
@@ -1125,9 +1129,11 @@ def _run_single_test(app, params: dict) -> dict:
             else:
                 # トグルが効いていない → set_focus フォールバックで確実に閉じる
                 log('[警告] テスターが閉じない → set_focus フォールバックで強制閉じ')
+                _prev_fg_fb = win32gui.GetForegroundWindow()
                 app.top_window().set_focus()
                 time.sleep(0.2)
                 app.top_window().type_keys('^r')
+                _restore_fg(_prev_fg_fb)
                 time.sleep(1.5)
 
         # テスターを開く (ini 再読み込み)
@@ -1138,20 +1144,21 @@ def _run_single_test(app, params: dict) -> dict:
         log(f'[MT4] テスター再起動スキップ: {e}')
 
     # 3. Start ボタンが出現するまでポーリングし、期間・モデル・日付を設定
-    PERIOD_INDEX = 2  # M15
+    PERIOD_INDEX = PERIOD_INDEX_MAP.get(TESTER_PERIOD, 2)
     try:
         model_index = int(TESTER_MODEL_FAST)
     except ValueError:
         model_index = 2
 
-    start_hwnd = None
+    start_hwnd  = None
+    _prev_fg_op = win32gui.GetForegroundWindow()  # コントロール操作前のフォーカス保存
     for attempt in range(30):
         ctrl = _collect_tester_controls(app)
         if ctrl['start'] is not None:
             log(f'[MT4] Start ボタン確認 (試行{attempt + 1}回目)')
             for key, fn in [
-                ('period',     lambda: ctrl['period'].select(PERIOD_INDEX)),
-                ('model',      lambda: ctrl['model'].select(model_index)),
+                ('period',     lambda: _cb_select(ctrl['period'], PERIOD_INDEX)),
+                ('model',      lambda: _cb_select(ctrl['model'],  model_index)),
                 ('date_start', lambda: ctrl['date_start'].set_time(
                     year=int(TESTER_FROM[:4]), month=int(TESTER_FROM[5:7]), day=int(TESTER_FROM[8:10]))),
                 ('date_end',   lambda: ctrl['date_end'].set_time(
@@ -1163,6 +1170,8 @@ def _run_single_test(app, params: dict) -> dict:
                         time.sleep(0.3)
                     except Exception as e:
                         log(f'[MT4] {key} 設定スキップ: {e}')
+            # コントロール設定後に MT4 がフォーカスを奪っていた場合は復元
+            _restore_fg(_prev_fg_op)
             start_hwnd = ctrl['start'].handle
             break
         time.sleep(1)
@@ -1173,13 +1182,16 @@ def _run_single_test(app, params: dict) -> dict:
         log('[MT4] Start ボタンが見つかりません（30秒タイムアウト）')
         return zero
 
-    # 4. ログファイルの現在サイズを記録
+    # 4. テスト開始前のレポートファイルの更新時刻を記録
     tester_log      = TESTER_DIR / 'logs' / f'{datetime.now().strftime("%Y%m%d")}.log'
     log_size_before = tester_log.stat().st_size if tester_log.exists() else 0
+    rpt_mtime_before = RPT_PATH.stat().st_mtime if RPT_PATH.exists() else 0.0
 
-    # 5. Start クリック
+    # 5. Start クリック (BM_CLICK で MT4 がフォーカスを奪うため直後に復元)
     time.sleep(0.5)
+    _prev_fg_click = win32gui.GetForegroundWindow()
     win32gui.SendMessage(start_hwnd, win32con.BM_CLICK, 0, 0)
+    _restore_fg(_prev_fg_click)
     log('[MT4] Start → テスト実行中...')
 
     # 6. テスト完了まで待機（ログファイルの変化を監視）
@@ -1207,8 +1219,17 @@ def _run_single_test(app, params: dict) -> dict:
         log(f'[警告] テストが {MAX_WAIT} 秒以内に完了しませんでした')
         return zero
 
-    log('[MT4] テスト完了 → ログ解析中...')
-    metrics = _parse_tester_log(tester_log, log_size_before)
+    # 7. MT4 が HTML レポートを書き込むまで待機（最大 30 秒）
+    log('[MT4] テスト完了 → HTMLレポート待機中...')
+    for _ in range(30):
+        if RPT_PATH.exists() and RPT_PATH.stat().st_mtime > rpt_mtime_before:
+            break
+        time.sleep(1)
+    else:
+        log('[警告] HTMLレポートが更新されませんでした（レポートなしで続行）')
+
+    # 8. MT4 の HTML レポートを解析（自前の損益計算は行わない）
+    metrics = _parse_mt4_report()
     if not metrics:
         metrics = {
             'profit_factor': 0.0, 'net_profit': 0.0, 'max_drawdown': 0.0,
@@ -1216,7 +1237,7 @@ def _run_single_test(app, params: dict) -> dict:
         }
     metrics['params'] = params
     log(f'[MT4]   → PF={metrics["profit_factor"]:.4f}  '
-        f'純益={metrics["net_profit"]:,.0f}JPY  '
+        f'純益={metrics["net_profit"]:,.0f}  '
         f'取引={metrics["total_trades"]}')
     return metrics
 
@@ -1252,26 +1273,29 @@ def _close_mt4(proc) -> None:
 
 
 def run_mt4_backtest(params: dict, fast_mode: bool = True) -> dict:
-    """スタンドアロン: MT4 を起動→テスト実行→終了してメトリクスを返す（backtest コマンド用）"""
+    """スタンドアロン: MT4 を起動→テスト実行→MT4 を開いたまま返す（backtest コマンド用）
+
+    Results/Graph タブを確認できるよう MT4 は終了しない。
+    """
     model = TESTER_MODEL_FAST if fast_mode else TESTER_MODEL_PRECISE
-    proc, app = _launch_mt4_session(model)
-    try:
-        return _run_single_test(app, params)
-    finally:
-        _close_mt4(proc)
+    _, app = _launch_mt4_session(model)
+    result = _run_single_test(app, params)
+    _restore_sleep()
+    log('[MT4] バックテスト完了。MT4 は開いたまま終了します（Results/Graph タブを確認してください）')
+    return result
 
 
 # ===== 遺伝的アルゴリズム =====
 
 # GA 設定
-GA_POP_SIZE   = 50   # 1世代の個体数  ※動作確認用（本番は50）
-GA_N_GEN      = 100    # 最大世代数     ※動作確認用（本番は100）
+GA_POP_SIZE   = 5   # 1世代の個体数  ※動作確認用（本番は50）
+GA_N_GEN      = 10    # 最大世代数     ※動作確認用（本番は100）
 GA_ELITE_N    = 10   # エリート継承数（上位N体をそのまま次世代へ）
 GA_N_CROSS    = 30   # 交叉で生成する個体数
 GA_N_RANDOM   = 10   # ランダム新規個体数（多様性維持）
 GA_MUT_RATE   = 0.5  # 突然変異率（1遺伝子あたりの変化確率）（デフォルト：0.2）
 GA_TOP_PARENT = 20   # 交叉に使う親の候補数（上位N体から選ぶ）
-GA_PATIENCE   = 16    # ベスト更新なしがこの世代数続いたら早期終了（デフォルト：8）
+GA_PATIENCE   = 1    # ベスト更新なしがこの世代数続いたら早期終了（デフォルト：8）
 
 
 def _random_individual(grid: dict) -> dict:
@@ -1296,6 +1320,21 @@ def _mutate(ind: dict, grid: dict, rate: float = GA_MUT_RATE) -> dict:
 def _ind_key(ind: dict) -> tuple:
     """個体を辞書順ソートしたタプルに変換（重複検出・キャッシュキー用）"""
     return tuple(sorted(ind.items()))
+
+
+def _score_results(results: list) -> None:
+    """results リストに composite_score を追加する（in-place）。
+
+    純益・トレード数をリスト内の最大値で正規化し、重み付き合計を計算する。
+    純益が負のものはスコア 0 として扱う。
+    """
+    np_vals = [r.get('net_profit', 0) or 0 for r in results]
+    tr_vals = [r.get('total_trades', 0) or 0 for r in results]
+    max_np  = max((v for v in np_vals if v > 0), default=1.0)
+    max_tr  = max(tr_vals, default=1.0) or 1.0
+    for r, np_val, tr_val in zip(results, np_vals, tr_vals):
+        r['composite_score'] = (SCORE_WEIGHT_NET_PROFIT   * max(np_val, 0) / max_np
+                              + SCORE_WEIGHT_TOTAL_TRADES  * tr_val         / max_tr)
 
 
 def _run_evolve(grid: dict, label: str,
@@ -1330,21 +1369,22 @@ def _run_evolve(grid: dict, label: str,
                 cache[_ind_key(r['params'])] = r
         all_results = list(seed_results)
         # 上位 elite_n 体を初期集団の種に、残りはランダムで多様性を確保
-        sorted_seeds = sorted(seed_results, key=lambda x: x.get('profit_factor') or 0, reverse=True)
+        _score_results(seed_results)
+        sorted_seeds = sorted(seed_results, key=lambda x: x.get('composite_score', 0), reverse=True)
         seed_inds    = [r['params'] for r in sorted_seeds[:elite_n]]
         population   = seed_inds + [_random_individual(grid) for _ in range(pop_size - len(seed_inds))]
         log(f'チェックポイント引き継ぎ: 評価済み {len(cache)} 件 / 初期種 {len(seed_inds)} 体')
     else:
         population = [_random_individual(grid) for _ in range(pop_size)]
 
-    best_pf    = -1.0
+    best_score = -1.0
     no_improve = 0
 
     for gen in range(1, n_gen + 1):
 
         # --- 評価 ---
-        scored    = []
         new_evals = 0
+        gen_items: list = []
         for i, ind in enumerate(population):
             key = _ind_key(ind)
             if key not in cache:
@@ -1352,24 +1392,34 @@ def _run_evolve(grid: dict, label: str,
                 data       = evaluator(ind)
                 cache[key] = data
                 new_evals += 1
-            data = cache[key]
-            scored.append((data.get('profit_factor', 0) or 0, data, ind))
+            gen_items.append((cache[key], ind))
 
+        # 世代内で正規化してスコア計算 (純益 70% + トレード数 30%)
+        np_vals = [d.get('net_profit', 0) or 0 for d, _ in gen_items]
+        tr_vals = [d.get('total_trades', 0) or 0 for d, _ in gen_items]
+        max_np  = max((v for v in np_vals if v > 0), default=1.0)
+        max_tr  = max(tr_vals, default=1.0) or 1.0
+        scored  = []
+        for (data, ind), np_val, tr_val in zip(gen_items, np_vals, tr_vals):
+            score = (SCORE_WEIGHT_NET_PROFIT   * max(np_val, 0) / max_np
+                   + SCORE_WEIGHT_TOTAL_TRADES  * tr_val         / max_tr)
+            scored.append((score, data, ind))
         scored.sort(key=lambda x: x[0], reverse=True)
 
         # --- 世代ログ ---
-        gen_pf = scored[0][0]
-        gen_np = scored[0][1].get('net_profit', 0)
-        star   = ''
-        if gen_pf > best_pf:
-            best_pf    = gen_pf
+        gen_score = scored[0][0]
+        gen_np    = scored[0][1].get('net_profit', 0)
+        gen_tr    = scored[0][1].get('total_trades', 0)
+        star      = ''
+        if gen_score > best_score:
+            best_score = gen_score
             no_improve = 0
             star       = '  ★ ベスト更新'
         else:
             no_improve += 1
             star        = f'  (改善なし {no_improve}/{patience})'
-        log(f'[{label} 第{gen:2d}世代] PF={gen_pf:.4f}  純益={gen_np:>8,.0f}JPY'
-            f'  新規={new_evals:2d}  累計={len(cache)}{star}')
+        log(f'[{label} 第{gen:2d}世代] スコア={gen_score:.4f}  純益={gen_np:>8,.0f}JPY'
+            f'  取引={gen_tr}  新規={new_evals:2d}  累計={len(cache)}{star}')
 
         all_results.extend([s[1] for s in scored])
 
@@ -1388,7 +1438,8 @@ def _run_evolve(grid: dict, label: str,
             if k not in ckpt_seen:
                 ckpt_seen.add(k)
                 ckpt_unique.append(r)
-        ckpt_unique.sort(key=lambda x: x.get('profit_factor') or 0, reverse=True)
+        _score_results(ckpt_unique)
+        ckpt_unique.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
         ckpt_path = RESULTS_DIR / f'{label}_checkpoint.json'
         ckpt_path.write_text(
             json.dumps(ckpt_unique, ensure_ascii=False, indent=2, default=str),
@@ -1414,7 +1465,7 @@ def _run_evolve(grid: dict, label: str,
 
         population = next_pop
 
-    # ユニーク化・PF降順ソート
+    # ユニーク化・スコア降順ソート
     seen: set  = set()
     unique: list = []
     for r in all_results:
@@ -1422,7 +1473,8 @@ def _run_evolve(grid: dict, label: str,
         if k not in seen:
             seen.add(k)
             unique.append(r)
-    unique.sort(key=lambda x: x.get('profit_factor') or 0, reverse=True)
+    _score_results(unique)
+    unique.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
     return unique
 
 
@@ -1587,7 +1639,8 @@ def cmd_adaptive():
     finally:
         _close_mt4(proc)
 
-    results.sort(key=lambda x: x.get('profit_factor') or 0, reverse=True)
+    _score_results(results)
+    results.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
 
     log(f'\n=== 適応パラメータ最適化完了 ===')
     log(f'ベースライン比較:')
@@ -1667,7 +1720,8 @@ def cmd_atr():
     finally:
         _close_mt4(proc)
 
-    results.sort(key=lambda x: x.get('profit_factor') or 0, reverse=True)
+    _score_results(results)
+    results.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
 
     best_r = results[0]
     log(f'\n=== ATRフィルター最適化完了 ===')
@@ -1692,7 +1746,7 @@ def cmd_atr():
 
 def _apply_ea_config(key: str):
     """tools/configs/<key>.json を読み込んでモジュールグローバルに適用する。"""
-    global EA_FILE, TESTER_INI, GRID, _INT_EA_PARAMS, RESULTS_DIR
+    global EA_FILE, TESTER_INI, GRID, _INT_EA_PARAMS, RESULTS_DIR, TESTER_SYMBOL, TESTER_PERIOD
 
     cfg_path = CONFIGS_DIR / f'{key}.json'
     if not cfg_path.exists():
@@ -1709,8 +1763,10 @@ def _apply_ea_config(key: str):
     GRID           = cfg['grid']
     _INT_EA_PARAMS = set(cfg['int_params'])
     RESULTS_DIR    = Path(__file__).parent / 'results' / key
+    TESTER_SYMBOL  = cfg.get('symbol', TESTER_SYMBOL)
+    TESTER_PERIOD  = cfg.get('period', TESTER_PERIOD)
     log(f'EA 設定読み込み: {cfg_path.name}  '
-        f'({len(GRID)} パラメータ / 結果: {RESULTS_DIR})')
+        f'({len(GRID)} パラメータ / {TESTER_SYMBOL} M{TESTER_PERIOD} / 結果: {RESULTS_DIR})')
 
 
 # ===== コマンド =====
@@ -1749,7 +1805,8 @@ def cmd_grid():
     finally:
         _close_mt4(proc)
 
-    results.sort(key=lambda x: x.get('profit_factor') or 0, reverse=True)
+    _score_results(results)
+    results.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
 
     log(f'\n=== グリッドサーチ完了 ({len(results)}/{len(combos)} 件) ===')
     print_report(results[0], results[0]['params'])

@@ -1,0 +1,23 @@
+{
+  "symbol": "USDJPY",
+  "period": "5",
+  "int_params": [
+    "Slippage",
+    "BB_Period",
+    "PurityWindow",
+    "TakeProfit",
+    "StopLoss",
+    "CooldownSeconds"
+  ],
+  "grid": {
+    "Lots":            [0.01],
+    "Slippage":        [10],
+    "BB_Period":       [10, 15, 20, 25],
+    "PurityWindow":    [5, 8, 10, 12, 15],
+    "PurityThreshold": [50.0, 60.0, 70.0, 80.0],
+    "PurityWickRatio": [0.0, 0.2, 0.4, 1.0],
+    "TakeProfit":      [2, 3, 4, 5],
+    "StopLoss":        [15, 20, 25, 30],
+    "CooldownSeconds": [0, 60, 120, 300]
+  }
+}
