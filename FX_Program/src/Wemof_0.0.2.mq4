@@ -1,11 +1,15 @@
 //+------------------------------------------------------------------+
-//|  Wemof_0.0.1.mq4                                                 |
+//|  Wemof_0.0.2.mq4                                                 |
 //|  Wemof (Wakkyai's Entry Model of FX) — 逆張りスキャルピング EA   |
 //|  対象: USDJPY M5                                                  |
+//|  0.0.2 変更点:                                                    |
+//|    - 全ティック判定（5分足完成前エントリー対応）                    |
+//|    - BBバンド幅フィルター追加 (BBWidthMax)                         |
+//|    - 現在バー変動幅比率フィルター追加 (MoveRatioMax)               |
 //+------------------------------------------------------------------+
 #property strict
-#property copyright "Wemof_0.0.1"
-#property version   "0.01"
+#property copyright "Wemof_0.0.2"
+#property version   "0.02"
 
 // ===== 入力パラメータ =====
 extern double Lots            = 0.01;   // ロット数
@@ -22,17 +26,21 @@ extern int    TakeProfit      = 3;      // 利確 (pips)
 extern int    StopLoss        = 20;     // 損切り (pips)
 extern int    CooldownSeconds = 60;     // エントリー後の再エントリー抑制 (秒)
 
+extern int    BBWidthMax      = 30;     // BBバンド幅上限 (pips, 0=フィルター無効)
+// バンド幅 = 上限 - 下限。値が大きい = ボラティリティ高 = トレンド相場。
+
+extern double MoveRatioMax    = 1.0;   // 直前確定足の変動幅に対する現在バー変動幅の比率上限
+// 例: 直前足が20pips・比率1.0 → 現在バーの変動が20pips以下のみエントリー許可
+
 // TODO: 除外条件フィルター（経済指標・ニュース・重要サポレジ・ラウンドナンバー）
 // TODO: 天底紐理論による利確ターゲット計算
-//         天井 = x + (f→x) / 純度
-//         底   = x - (f→x) / 純度
 
 // ===== 定数 =====
-#define MAGIC 20250001
-#define BB_DEVIATION 3.0
+#define MAGIC          20250002
+#define BB_DEVIATION   3.0
+#define MAX_MOVE_PIPS  50.0   // 現在バーの変動がこの値(pips)以上なら常にエントリー禁止
 
 // ===== 状態変数 =====
-datetime g_lastBarTime  = 0;
 datetime g_lastTradeTime = 0;
 
 //+------------------------------------------------------------------+
@@ -44,34 +52,45 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-    // M5 バーの先頭ティックのみ処理（終値ベース判定）
-    datetime curBarTime = iTime(NULL, PERIOD_M5, 0);
-    if (curBarTime == g_lastBarTime) return;
-    g_lastBarTime = curBarTime;
-
     // クールダウン中はスキップ
     if (TimeCurrent() - g_lastTradeTime < CooldownSeconds) return;
 
     // 未決済ポジションがあればスキップ
     if (CountPositions() > 0) return;
 
-    // ----- インジケーター取得（index=1: 直前確定足） -----
-    double close1  = iClose(NULL, PERIOD_M5, 1);
-    double bbUpper = iBands(NULL, PERIOD_M5, BB_Period, BB_DEVIATION, 0, PRICE_CLOSE, MODE_UPPER, 1);
-    double bbLower = iBands(NULL, PERIOD_M5, BB_Period, BB_DEVIATION, 0, PRICE_CLOSE, MODE_LOWER, 1);
-
-    // ----- 純度計算 -----
-    double upPurity   = CalcPurity(PurityWindow, true);   // 陽線比率 (%)
-    double downPurity = CalcPurity(PurityWindow, false);  // 陰線比率 (%)
-
     // ----- pip サイズ計算 -----
     int    digits  = (int)MarketInfo(Symbol(), MODE_DIGITS);
     double pipSize = Point * (digits == 3 || digits == 5 ? 10.0 : 1.0);
-    double tpPts   = TakeProfit * pipSize;
-    double slPts   = StopLoss   * pipSize;
 
-    // ----- ショートエントリー: 純度高い上昇 + 終値 ≥ +3σ -----
-    if (close1 >= bbUpper && upPurity >= PurityThreshold)
+    // ----- インジケーター取得（index=0: 現在バーのリアルタイム BB） -----
+    // 5分足完成前エントリーのため、現在価格が現在バーの BB を超えているか判定する
+    double bbUpper = iBands(NULL, PERIOD_M5, BB_Period, BB_DEVIATION, 0, PRICE_CLOSE, MODE_UPPER, 0);
+    double bbLower = iBands(NULL, PERIOD_M5, BB_Period, BB_DEVIATION, 0, PRICE_CLOSE, MODE_LOWER, 0);
+
+    // ----- BBバンド幅フィルター -----
+    double bbWidthPips = (bbUpper - bbLower) / pipSize;
+    if (BBWidthMax > 0 && bbWidthPips > BBWidthMax) return;
+
+    // ----- 現在バー変動幅フィルター -----
+    double prevRangePips = (iHigh(NULL, PERIOD_M5, 1) - iLow(NULL, PERIOD_M5, 1)) / pipSize;
+    double curMovePips   = MathAbs(Bid - iOpen(NULL, PERIOD_M5, 0)) / pipSize;
+
+    // 現在バーの変動が 50pips 以上はエントリー禁止
+    if (curMovePips >= MAX_MOVE_PIPS) return;
+
+    // 直前確定足の変動幅に対する現在バー変動の比率チェック
+    if (prevRangePips > 0.0 && curMovePips / prevRangePips > MoveRatioMax) return;
+
+    // ----- 純度計算（確定足ベース） -----
+    double upPurity   = CalcPurity(PurityWindow, true);   // 陽線比率 (%)
+    double downPurity = CalcPurity(PurityWindow, false);  // 陰線比率 (%)
+
+    // ----- TP/SL 計算 -----
+    double tpPts = TakeProfit * pipSize;
+    double slPts = StopLoss   * pipSize;
+
+    // ----- ショートエントリー: 現在 Bid ≥ +3σ かつ 純度条件 -----
+    if (Bid >= bbUpper && upPurity >= PurityThreshold)
     {
         double entry = Bid;
         double sl    = NormalizeDouble(entry + slPts, digits);
@@ -80,8 +99,8 @@ void OnTick()
                                sl, tp, "Wemof", MAGIC, 0, clrRed);
         if (ticket > 0) g_lastTradeTime = TimeCurrent();
     }
-    // ----- ロングエントリー: 純度高い下落 + 終値 ≤ -3σ -----
-    else if (close1 <= bbLower && downPurity >= PurityThreshold)
+    // ----- ロングエントリー: 現在 Ask ≤ -3σ かつ 純度条件 -----
+    else if (Ask <= bbLower && downPurity >= PurityThreshold)
     {
         double entry = Ask;
         double sl    = NormalizeDouble(entry - slPts, digits);
