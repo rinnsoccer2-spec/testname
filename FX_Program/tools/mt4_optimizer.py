@@ -16,7 +16,6 @@ MT4 EA パラメータ最適化スクリプト (Strategy Tester 直接実行版)
 注意: 実行中は MT4 を手動で開かないこと（プロセス競合）。
 """
 
-import struct
 import subprocess
 import re
 import sys
@@ -26,14 +25,9 @@ import itertools
 import random
 from pathlib import Path
 from datetime import datetime
-from collections import defaultdict
-
-import numpy as np
-import pandas as pd
 
 # ===== パス設定 =====
 MT4_DATA    = Path(r"C:\Users\rinns\AppData\Roaming\MetaQuotes\Terminal\082F53F5881F3D6022DF806C3D307B50")
-HST_PATH    = MT4_DATA / "history" / "XMTrading-Demo 6" / "GOLD15.hst"
 RESULTS_DIR = Path(__file__).parent / "results"
 
 
@@ -51,6 +45,7 @@ MAX_SAMPLES          = 100
 # ===== 評価スコア重み =====
 SCORE_WEIGHT_NET_PROFIT   = 0.7  # 純益の重み
 SCORE_WEIGHT_TOTAL_TRADES = 0.3  # 総トレード数の重み
+MIN_TRADES                = 360   # これ未満のトレード数は過学習とみなしスコア0
 
 # ===== MT4 テスター設定 =====
 MT4_EXE     = Path(r"C:\Program Files (x86)\XMTrading MT4\terminal.exe")
@@ -66,7 +61,7 @@ TESTER_FROM          = "2023.06.06"
 TESTER_TO            = "2026.06.05"
 TESTER_SYMBOL        = "GOLD"
 TESTER_PERIOD        = "15"    # M15
-TESTER_MODEL_FAST    = "2"     # 始値のみ (Open Prices Only): 2-6秒/回 (GA最適化用)
+TESTER_MODEL_FAST    = "1"     # コントロールポイント (Control Points): 全ティック判定EA用
 TESTER_MODEL_PRECISE = "1"     # コントロールポイント (Control Points): 最終検証用
 TESTER_SPREAD        = "current"
 TESTER_DEPOSIT       = 50000000  # 50M JPY: 残高不足を防ぐ
@@ -78,382 +73,6 @@ PERIOD_INDEX_MAP = {'1': 0, '5': 1, '15': 2, '30': 3, '60': 4, '240': 5, '1440':
 
 def log(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-
-
-# ===== HST 読み込み =====
-
-def load_hst(path: Path) -> pd.DataFrame:
-    """MT4 .hst を読み込み DataFrame を返す
-
-    v400: header=148, bar=44  int32(time)+double*4(open,low,high,close)+int64(vol)
-    v401: header=148, bar=60  int64(time)+double*4(open,high,low,close)+int64(tv)+int32(spread)+int64(rv)
-    v401 は high/low の順が v400 と逆なので注意
-    """
-    data    = path.read_bytes()
-    version = struct.unpack_from('<i', data, 0)[0]
-
-    HEADER = 148
-    if version == 400:
-        BAR = 44
-        fmt = '<iddddq'   # time(int32), open, low, high, close, volume
-        cols = ['time', 'open', 'low', 'high', 'close', 'volume']
-    elif version == 401:
-        BAR = 60
-        fmt = '<qddddqiq'  # time(int64), open, HIGH, LOW, close, tv, spread, rv
-        cols = ['time', 'open', 'high', 'low', 'close', 'tick_vol', 'spread', 'real_vol']
-    else:
-        raise ValueError(f"未対応の HST バージョン: {version}")
-
-    n    = (len(data) - HEADER) // BAR
-    rows = [struct.unpack_from(fmt, data, HEADER + i * BAR) for i in range(n)]
-
-    df = pd.DataFrame(rows, columns=cols)
-    df['dt'] = pd.to_datetime(df['time'], unit='s')
-
-    df = df[(df['dt'] >= FROM_DATE) & (df['dt'] <= TO_DATE)].reset_index(drop=True)
-    return df
-
-
-# ===== インジケーター =====
-
-def calc_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
-    """ADX (Wilder's smoothing) を計算する"""
-    n    = len(close)
-    tr   = np.zeros(n)
-    dm_p = np.zeros(n)
-    dm_m = np.zeros(n)
-
-    for i in range(1, n):
-        tr[i]   = max(high[i] - low[i],
-                      abs(high[i] - close[i-1]),
-                      abs(low[i]  - close[i-1]))
-        up      = high[i] - high[i-1]
-        dn      = low[i-1] - low[i]
-        dm_p[i] = up if up > dn and up > 0 else 0.0
-        dm_m[i] = dn if dn > up and dn > 0 else 0.0
-
-    atr = np.zeros(n)
-    sdp = np.zeros(n)
-    sdm = np.zeros(n)
-    atr[period] = tr[1:period+1].sum()
-    sdp[period] = dm_p[1:period+1].sum()
-    sdm[period] = dm_m[1:period+1].sum()
-
-    for i in range(period + 1, n):
-        atr[i] = atr[i-1] - atr[i-1] / period + tr[i]
-        sdp[i] = sdp[i-1] - sdp[i-1] / period + dm_p[i]
-        sdm[i] = sdm[i-1] - sdm[i-1] / period + dm_m[i]
-
-    di_p   = np.where(atr > 0, 100 * sdp / atr, 0.0)
-    di_m   = np.where(atr > 0, 100 * sdm / atr, 0.0)
-    di_sum = di_p + di_m
-    dx     = np.where(di_sum > 0, 100 * np.abs(di_p - di_m) / di_sum, 0.0)
-
-    adx   = np.zeros(n)
-    start = 2 * period
-    if start < n:
-        adx[start] = dx[period:start+1].mean()
-        for i in range(start + 1, n):
-            adx[i] = (adx[i-1] * (period - 1) + dx[i]) / period
-
-    return adx
-
-
-def calc_atr_ratio(high: np.ndarray, low: np.ndarray, close: np.ndarray,
-                   short_period: int, baseline_period: int) -> np.ndarray:
-    """短期ATR / 基準ATR の比率を返す (1.0超 = 平常より高ボラ状態)
-
-    固定閾値でなく比率で判定するため、GOLD価格水準が変わっても機能する。
-    """
-    tr = np.empty(len(close))
-    tr[0] = high[0] - low[0]
-    tr[1:] = np.maximum(
-        high[1:] - low[1:],
-        np.maximum(np.abs(high[1:] - close[:-1]),
-                   np.abs(low[1:]  - close[:-1]))
-    )
-    tr_s       = pd.Series(tr)
-    atr_short  = tr_s.rolling(short_period,    min_periods=short_period).mean().fillna(0).values
-    atr_base   = tr_s.rolling(baseline_period, min_periods=baseline_period).mean().fillna(0).values
-    return np.where(atr_base > 0, atr_short / atr_base, 1.0)
-
-
-def calc_sar(high: np.ndarray, low: np.ndarray, step: float, max_val: float) -> np.ndarray:
-    """Parabolic SAR を計算する"""
-    n    = len(high)
-    sar  = np.zeros(n)
-    bull = True
-    af   = step
-    ep   = high[0]
-    sar[0] = low[0]
-
-    for i in range(1, n):
-        if bull:
-            sar[i] = sar[i-1] + af * (ep - sar[i-1])
-            if i >= 2:
-                sar[i] = min(sar[i], low[i-1], low[i-2])
-            else:
-                sar[i] = min(sar[i], low[i-1])
-
-            if low[i] < sar[i]:
-                bull   = False
-                sar[i] = ep
-                ep     = low[i]
-                af     = step
-            else:
-                if high[i] > ep:
-                    ep = high[i]
-                    af = min(af + step, max_val)
-        else:
-            sar[i] = sar[i-1] - af * (sar[i-1] - ep)
-            if i >= 2:
-                sar[i] = max(sar[i], high[i-1], high[i-2])
-            else:
-                sar[i] = max(sar[i], high[i-1])
-
-            if high[i] > sar[i]:
-                bull   = True
-                sar[i] = ep
-                ep     = high[i]
-                af     = step
-            else:
-                if low[i] < ep:
-                    ep = low[i]
-                    af = min(af + step, max_val)
-
-    return sar
-
-
-# ===== EA シミュレーション =====
-
-def simulate_ea(df: pd.DataFrame, params: dict) -> list:
-    """PDX+SAR_0.0.1 EA ロジックをバー単位でシミュレートする
-
-    バー i でのシミュレーション順序:
-      1. 保有ポジションの SL/TP チェック (バーの high/low で判定)
-      2. SAR 反転による決済 (バーの close で判定)
-      3. 適応型停止チェック（直近勝率が閾値未満なら停止中）
-      4. クールダウンチェック
-      5. エントリー条件チェック → 新規建て
-
-    適応型停止パラメータ (AdaptiveWindow=0 で無効):
-      AdaptiveWindow    : 監視する直近トレード数
-      AdaptivePauseWR   : 停止トリガー勝率 (例: 0.10 = 10%)
-      AdaptivePauseHours: 停止する時間数 (例: 48 = 48時間)
-    """
-    lots     = params['Lots']
-    period   = params['ADX_Period']
-    adx_thr  = params['ADX_Threshold']
-    s_step   = params['SAR_Step']
-    s_max    = params['SAR_Max']
-    s_trend  = int(params['SAR_Min_Trend'])
-    sl_pts   = params['StopLoss']
-    tp_pts   = params['TakeProfit']
-    cooldown = params['CooldownSeconds']
-
-    # 適応型停止パラメータ (デフォルト: 無効)
-    adap_window     = int(params.get('AdaptiveWindow', 0))
-    adap_pause_wr   = float(params.get('AdaptivePauseWR', 0.10))
-    adap_pause_secs = int(params.get('AdaptivePauseHours', 48)) * 3600
-
-    # ATRフィルターパラメータ (ATR_Short=0 で無効)
-    atr_short_p = int(params.get('ATR_Short', 0))
-    atr_base_p  = int(params.get('ATR_Baseline', 100))
-    atr_mult    = float(params.get('ATR_Multiplier', 1.5))
-
-    high_a  = df['high'].values
-    low_a   = df['low'].values
-    close_a = df['close'].values
-    time_a  = df['time'].values.astype(np.int64)
-    dt_a    = df['dt'].dt.to_pydatetime()
-
-    adx_a = calc_adx(high_a, low_a, close_a, period)
-    sar_a = calc_sar(high_a, low_a, s_step, s_max)
-    atr_ratio_a = (calc_atr_ratio(high_a, low_a, close_a, atr_short_p, atr_base_p)
-                   if atr_short_p > 0 else None)
-
-    warmup = max(2 * period + s_trend + 2,
-                 atr_base_p if atr_short_p > 0 else 0)
-    trades = []
-    pos    = None
-    last_exit_ts    = 0
-    adap_resume_ts  = 0   # 適応停止の解除タイムスタンプ (0=停止中でない)
-    recent_wins: list = []  # 直近 adap_window 件の勝敗 (True=勝, False=負)
-
-    for i in range(warmup, len(df)):
-        bid    = close_a[i]
-        ask    = bid + SPREAD * POINT
-        ts     = int(time_a[i])
-        bar_dt = dt_a[i]
-
-        # --- CheckExit ---
-        if pos is not None:
-            exited      = False
-            exit_price  = 0.0
-            exit_reason = ''
-
-            if pos['type'] == 'buy':
-                if low_a[i] <= pos['sl']:
-                    exit_price, exit_reason, exited = pos['sl'], 'SL', True
-                elif high_a[i] >= pos['tp']:
-                    exit_price, exit_reason, exited = pos['tp'], 'TP', True
-                elif sar_a[i] > bid:
-                    exit_price, exit_reason, exited = bid,       'SAR', True
-            else:  # sell
-                if high_a[i] >= pos['sl']:
-                    exit_price, exit_reason, exited = pos['sl'], 'SL', True
-                elif low_a[i] <= pos['tp']:
-                    exit_price, exit_reason, exited = pos['tp'], 'TP', True
-                elif sar_a[i] < ask:
-                    exit_price, exit_reason, exited = ask,       'SAR', True
-
-            if exited:
-                if pos['type'] == 'buy':
-                    profit_usd = (exit_price - pos['entry']) * lots * LOT_SIZE
-                else:
-                    profit_usd = (pos['entry'] - exit_price) * lots * LOT_SIZE
-                profit_jpy = profit_usd * JPY_RATE
-                trades.append({
-                    'open_dt':     pos['open_dt'],
-                    'close_dt':    bar_dt,
-                    'type':        pos['type'],
-                    'entry':       pos['entry'],
-                    'exit':        exit_price,
-                    'profit_usd':  profit_usd,
-                    'profit_jpy':  profit_jpy,
-                    'exit_reason': exit_reason,
-                })
-                last_exit_ts = ts
-                pos = None
-
-                # --- 適応型停止: 直近勝率を更新して停止判定 ---
-                if adap_window > 0:
-                    recent_wins.append(profit_jpy > 0)
-                    if len(recent_wins) > adap_window:
-                        recent_wins.pop(0)
-                    if len(recent_wins) >= adap_window:
-                        wr = sum(recent_wins) / adap_window
-                        if wr < adap_pause_wr and adap_resume_ts == 0:
-                            adap_resume_ts = ts + adap_pause_secs
-                            recent_wins = []  # 再開後は新しいウィンドウで再評価
-
-        # --- 適応型停止チェック ---
-        if adap_window > 0 and adap_resume_ts > 0:
-            if ts >= adap_resume_ts:
-                adap_resume_ts = 0  # 停止期間終了
-            else:
-                continue  # まだ停止中
-
-        # --- エントリー条件 ---
-        if pos is not None:
-            continue
-        if ts - last_exit_ts < cooldown:
-            continue
-        # ATRフィルター: 短期ATR が基準の atr_mult 倍超なら高ボラとみなしスキップ
-        if atr_ratio_a is not None and atr_ratio_a[i] > atr_mult:
-            continue
-
-        adx_cur  = adx_a[i]
-        adx_prev = adx_a[i - 1]
-        sar_cur  = sar_a[i]
-
-        if adx_cur <= adx_thr or adx_cur <= adx_prev:
-            continue
-
-        # IsSARTrend: 直近 s_trend 本のバー (index 1..s_trend) が同方向か確認
-        buy_ok = all(sar_a[i - j] < close_a[i - j] for j in range(1, s_trend + 1))
-        sel_ok = all(sar_a[i - j] > close_a[i - j] for j in range(1, s_trend + 1))
-
-        if sar_cur < bid and buy_ok:
-            pos = {
-                'type':    'buy',
-                'entry':   ask,
-                'sl':      ask - sl_pts * POINT,
-                'tp':      ask + tp_pts * POINT,
-                'open_dt': bar_dt,
-            }
-        elif sar_cur > ask and sel_ok:
-            pos = {
-                'type':    'sell',
-                'entry':   bid,
-                'sl':      bid + sl_pts * POINT,
-                'tp':      bid - tp_pts * POINT,
-                'open_dt': bar_dt,
-            }
-
-    return trades
-
-
-# ===== メトリクス計算 =====
-
-def calc_metrics(trades: list, params: dict) -> dict:
-    if not trades:
-        return {
-            'net_profit': 0, 'profit_factor': 0, 'max_drawdown': 0,
-            'total_trades': 0, 'win_rate_pct': 0, 'avg_win': 0, 'avg_loss': 0,
-            'monthly_trades': {}, 'params': params,
-        }
-
-    profits = [t['profit_jpy'] for t in trades]
-    wins    = [p for p in profits if p > 0]
-    losses  = [p for p in profits if p < 0]
-
-    gross_win  = sum(wins)   if wins   else 0.0
-    gross_loss = abs(sum(losses)) if losses else 0.0
-    pf = gross_win / gross_loss if gross_loss > 0 else 9999.0
-
-    equity = np.cumsum([0.0] + profits)
-    peak   = np.maximum.accumulate(equity)
-    max_dd = float(np.max(peak - equity))
-
-    monthly = defaultdict(int)
-    for t in trades:
-        monthly[t['open_dt'].strftime('%Y-%m')] += 1
-
-    consec = _analyze_consecutive_losses(trades, profits)
-
-    return {
-        'net_profit':    round(gross_win - gross_loss, 0),
-        'profit_factor': round(pf, 4),
-        'max_drawdown':  round(max_dd, 0),
-        'total_trades':  len(trades),
-        'win_rate_pct':  round(len(wins) / len(profits) * 100, 2),
-        'avg_win':       round(gross_win  / len(wins)   if wins   else 0, 0),
-        'avg_loss':      round(sum(losses) / len(losses) if losses else 0, 0),
-        'monthly_trades': dict(sorted(monthly.items())),
-        **consec,
-        'params': params,
-    }
-
-
-def _analyze_consecutive_losses(trades: list, profits: list) -> dict:
-    streaks: list = []
-    cur: list = []
-    for t, p in zip(trades, profits):
-        if p < 0:
-            cur.append(t)
-        else:
-            if cur:
-                streaks.append(cur[:])
-                cur = []
-    if cur:
-        streaks.append(cur)
-
-    if not streaks:
-        return {}
-
-    longest   = max(streaks, key=len)
-    hour_dist: dict = defaultdict(int)
-    for s in streaks:
-        if len(s) >= 2:
-            hour_dist[s[0]['open_dt'].hour] += 1
-
-    return {
-        'longest_consec_loss_count': len(longest),
-        'longest_consec_loss_start': longest[0]['open_dt'].strftime('%Y.%m.%d %H:%M'),
-        'longest_consec_loss_hours': [t['open_dt'].hour for t in longest],
-        'consec_loss_start_hour_dist': dict(sorted(hour_dist.items())),
-    }
 
 
 # ===== 出力 =====
@@ -603,72 +222,88 @@ def _update_tester_config(model: str = TESTER_MODEL_FAST):
     TERM_INI.write_text(new_content, encoding='utf-8')
 
 
-def _parse_mt4_report() -> dict:
-    """MT4 HTML レポートからメトリクスを抽出して返す"""
-    if not RPT_PATH.exists():
-        log(f'[警告] レポートが見つかりません: {RPT_PATH}')
+def _parse_tester_log(log_path: Path, pos_before: int) -> dict:
+    """テスターログ (cp932) を解析してメトリクスを返す。HTML レポートの代替。
+
+    シンボル判定:
+      - USDJPY 系 (symbol に JPY を含む): contract=100000, 損益は JPY のまま
+      - GOLD / XAUUSD 系: contract=100 oz, 損益は USD → JPY 換算 (固定レート)
+      GA の相対比較が目的なので固定レートで問題ない。
+    """
+    try:
+        with open(log_path, 'rb') as f:
+            f.seek(pos_before)
+            raw = f.read()
+        text = raw.decode('cp932', errors='replace')
+    except Exception as e:
+        log(f'[ログ解析] 読み込み失敗: {e}')
         return {}
 
-    # MT4 レポートは UTF-16 LE または UTF-8 で保存される
-    for enc in ('utf-16', 'utf-8', 'cp932'):
-        try:
-            html = RPT_PATH.read_text(encoding=enc, errors='strict')
-            break
-        except (UnicodeDecodeError, UnicodeError):
-            html = ''
-    if not html:
-        log('[警告] レポートの文字コード読み取りに失敗しました')
+    # シンボルを特定して contract_size / JPY 換算倍率を決定
+    sym_m = re.search(r'open #\d+ (?:buy|sell) [\d.]+ (\w+) at', text)
+    symbol = sym_m.group(1).upper() if sym_m else ''
+    if 'JPY' in symbol:
+        contract_size = 100_000.0
+        jpy_mult      = 1.0
+    elif 'GOLD' in symbol or 'XAU' in symbol:
+        contract_size = 100.0
+        jpy_mult      = 150.0  # 固定近似レート (最適化の相対比較用)
+    else:
+        contract_size = 100_000.0
+        jpy_mult      = 1.0
+
+    open_pat = re.compile(r'open #(\d+) (buy|sell) ([\d.]+) \w+ at ([\d.]+)')
+    tp_pat   = re.compile(r'Tester: take profit #(\d+) at ([\d.]+)')
+    sl_pat   = re.compile(r'Tester: stop loss #(\d+) at ([\d.]+)')
+    cls_pat  = re.compile(r'Tester: order #(\d+) is closed')
+
+    opens  = {}
+    closes = {}
+    for line in text.splitlines():
+        m = open_pat.search(line)
+        if m:
+            num, typ, lots, entry = m.groups()
+            opens[int(num)] = (typ, float(lots), float(entry))
+            continue
+        m = tp_pat.search(line) or sl_pat.search(line)
+        if m:
+            closes[int(m.group(1))] = float(m.group(2))
+            continue
+        m = cls_pat.search(line)
+        if m:
+            num = int(m.group(1))
+            if num in opens and num not in closes:
+                closes[num] = opens[num][2]  # テスト期間末クローズ = P&L 0
+
+    profits = []
+    for num, (typ, lots, entry) in opens.items():
+        if num not in closes:
+            continue
+        exit_p = closes[num]
+        mult   = lots * contract_size * jpy_mult
+        pnl    = (exit_p - entry) * mult if typ == 'buy' else (entry - exit_p) * mult
+        profits.append(pnl)
+
+    if not profits:
         return {}
 
-    # HTMLタグを除いたトークン列を作成
-    tokens = [t.strip() for t in re.findall(r'>([^<]+)<', html) if t.strip()]
-
-    def find_next(label: str) -> str:
-        """ラベルに一致するトークンの直後の値トークンを返す"""
-        for i, t in enumerate(tokens):
-            if label.lower() in t.lower() and i + 1 < len(tokens):
-                v = tokens[i + 1]
-                if re.match(r'^-?[\d,. ]+', v):
-                    return v
-        return ''
-
-    def to_float(s: str) -> float:
-        s = s.replace(',', '').replace(' ', '').strip()
-        try:
-            return float(s)
-        except ValueError:
-            return 0.0
-
-    pf         = to_float(find_next('Profit Factor'))
-    net_profit = to_float(find_next('Total Net Profit'))
-    max_dd     = to_float(find_next('Absolute Drawdown'))
-    if max_dd == 0:
-        max_dd = to_float(find_next('Maximal drawdown'))
-    total      = int(to_float(find_next('Total Trades')))
-
-    # 勝率: "38 (25.85%)" のような形式を解析
-    wr = 0.0
-    avg_win  = 0.0
-    avg_loss = 0.0
-    for i, t in enumerate(tokens):
-        if 'profit trades' in t.lower() and i + 1 < len(tokens):
-            m = re.search(r'([\d.]+)\s*%', tokens[i + 1])
-            if m:
-                wr = float(m.group(1))
-        if 'average profit trade' in t.lower() and i + 1 < len(tokens):
-            avg_win = to_float(tokens[i + 1])
-        if 'average loss trade' in t.lower() and i + 1 < len(tokens):
-            avg_loss = to_float(tokens[i + 1])
+    wins       = [p for p in profits if p > 0]
+    losses     = [p for p in profits if p <= 0]
+    gross_win  = sum(wins) if wins else 0.0
+    gross_loss = abs(sum(losses)) if losses else 0.0
+    pf         = gross_win / gross_loss if gross_loss > 0 else 9999.0
+    net_profit = gross_win - gross_loss
 
     return {
-        'profit_factor': pf,
-        'net_profit':    net_profit,
-        'max_drawdown':  max_dd,
-        'total_trades':  total,
-        'win_rate_pct':  round(wr, 2),
-        'avg_win':       avg_win,
-        'avg_loss':      avg_loss,
+        'profit_factor': round(pf, 4),
+        'net_profit':    round(net_profit, 0),
+        'max_drawdown':  0.0,
+        'total_trades':  len(profits),
+        'win_rate_pct':  round(len(wins) / len(profits) * 100, 2),
+        'avg_win':       round(gross_win / len(wins) if wins else 0, 0),
+        'avg_loss':      round(sum(losses) / len(losses) if losses else 0, 0),
     }
+
 
 
 
@@ -765,108 +400,7 @@ def _collect_tester_controls(app) -> dict:
     return found
 
 
-def _configure_and_start_tester(app, model: str) -> bool:
-    """
-    テスターの期間・モデル・日付を UI から直接設定し、
-    スタートボタンを2回 SendMessage(BM_CLICK) で押す。
 
-    BM_CLICK を2回送る理由: 1回目でフォーカスが当たり、
-    2回目で実際のテスト開始トリガーになる（MT4の動作）。
-    """
-    import win32gui
-    import win32con
-    import time
-
-    PERIOD_INDEX = PERIOD_INDEX_MAP.get(TESTER_PERIOD, 2)
-
-    # モデル: terminal.ini の Model= 値をそのまま ComboBox インデックスとして使う
-    try:
-        model_index = int(model)
-    except ValueError:
-        model_index = 1  # デフォルト = Control Points
-
-    ctrl = _collect_tester_controls(app)
-    log(f'[MT4] コントロール収集結果: '
-        f'start={ctrl["start"] is not None} '
-        f'period={ctrl["period"] is not None} '
-        f'model={ctrl["model"] is not None} '
-        f'date_start={ctrl["date_start"] is not None} '
-        f'date_end={ctrl["date_end"] is not None}')
-
-    if ctrl['start'] is None:
-        return False
-
-    # 期間を設定
-    if ctrl['period'] is not None:
-        try:
-            _cb_select(ctrl['period'], PERIOD_INDEX)
-            time.sleep(0.3)
-            log(f'[MT4] 期間設定: インデックス {PERIOD_INDEX}')
-        except Exception as e:
-            log(f'[MT4] 期間設定スキップ: {e}')
-
-    # モデルを設定
-    if ctrl['model'] is not None:
-        try:
-            _cb_select(ctrl['model'], model_index)
-            time.sleep(0.3)
-            log(f'[MT4] モデル設定: インデックス {model_index}')
-        except Exception as e:
-            log(f'[MT4] モデル設定スキップ: {e}')
-
-    # 開始日・終了日を設定
-    if ctrl['date_start'] is not None:
-        try:
-            ctrl['date_start'].set_time(year=int(TESTER_FROM[:4]),
-                                        month=int(TESTER_FROM[5:7]),
-                                        day=int(TESTER_FROM[8:10]))
-            time.sleep(0.3)
-            log(f'[MT4] 開始日設定: {TESTER_FROM}')
-        except Exception as e:
-            log(f'[MT4] 開始日設定スキップ: {e}')
-
-    if ctrl['date_end'] is not None:
-        try:
-            ctrl['date_end'].set_time(year=int(TESTER_TO[:4]),
-                                      month=int(TESTER_TO[5:7]),
-                                      day=int(TESTER_TO[8:10]))
-            time.sleep(0.3)
-            log(f'[MT4] 終了日設定: {TESTER_TO}')
-        except Exception as e:
-            log(f'[MT4] 終了日設定スキップ: {e}')
-
-    # スタートボタンを SendMessage(BM_CLICK) で1回押す
-    hwnd = ctrl['start'].handle
-    try:
-        win32gui.SendMessage(hwnd, win32con.BM_CLICK, 0, 0)
-        log('[MT4] Start クリック (SendMessage BM_CLICK)')
-        return True
-    except Exception as e:
-        log(f'[MT4] BM_CLICK 失敗 ({e})')
-        return False
-
-
-def _dump_mt4_controls(app):
-    """デバッグ用: MT4 の全コントロール一覧をログ出力する"""
-    def _walk(win, prefix=''):
-        try:
-            for child in win.children():
-                try:
-                    cls  = child.class_name()
-                    text = child.window_text().strip()
-                    log(f'{prefix}[{cls}] "{text}"')
-                    _walk(child, prefix + '  ')
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    for win in app.windows():
-        try:
-            log(f'[MT4 window] "{win.window_text()}" class={win.class_name()}')
-            _walk(win, '  ')
-        except Exception as e:
-            log(f'[MT4 dump error] {e}')
 
 
 _TESTER_TOGGLE_CMD: int = 0  # Strategy Tester トグルのメニューコマンドID (0=未取得)
@@ -928,21 +462,19 @@ def _toggle_tester_bg(app) -> bool:
     # 方法2: AttachThreadInput + keybd_event
     # PostMessage(WM_KEYDOWN) は GetKeyState を更新しないため Ctrl+R が届かない。
     # keybd_event はカーネルレベルで GetKeyState を更新するため確実。
+    #
+    # 設計: Ctrl+R 送信後の SetForegroundWindow 失敗は無視して True を返す。
+    # 失敗したまま方法3に落ちると二重 Ctrl+R でトグルが元に戻るため。
+    KEYEVENTF_KEYUP = 0x0002
+    VK_R = 0x52
+    prev_hwnd    = win32gui.GetForegroundWindow()
+    our_tid      = ctypes.windll.kernel32.GetCurrentThreadId()
+    target_tid   = win32process.GetWindowThreadProcessId(hwnd)[0]
+    fg_tid       = win32process.GetWindowThreadProcessId(prev_hwnd)[0] if prev_hwnd else 0
+    attached_fg  = False
+    attached_tgt = False
+    ctrlr_sent   = False
     try:
-        KEYEVENTF_KEYUP = 0x0002
-        VK_R = 0x52
-
-        prev_hwnd  = win32gui.GetForegroundWindow()
-        our_tid    = ctypes.windll.kernel32.GetCurrentThreadId()
-        target_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
-
-        # 入力スレッドをアタッチ → SetForegroundWindow が確実に動作する
-        # フォアグラウンドスレッドと MT4 スレッドの両方にアタッチする。
-        # SetForegroundWindow の呼び出し権限はフォアグラウンドスレッドへの
-        # AttachThreadInput によって得られるため、両方が必要。
-        fg_tid       = win32process.GetWindowThreadProcessId(prev_hwnd)[0] if prev_hwnd else 0
-        attached_fg  = False
-        attached_tgt = False
         if our_tid != fg_tid and fg_tid:
             attached_fg  = bool(ctypes.windll.user32.AttachThreadInput(our_tid, fg_tid, True))
         if our_tid != target_tid:
@@ -956,22 +488,34 @@ def _toggle_tester_bg(app) -> bool:
         win32api.keybd_event(VK_R, 0, 0, 0)
         win32api.keybd_event(VK_R, 0, KEYEVENTF_KEYUP, 0)
         win32api.keybd_event(win32con.VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        ctrlr_sent = True
         time.sleep(0.08)
-
-        # 直前のウィンドウをフォアグラウンドに戻す (AttachThreadInput が有効な間に実行)
-        if prev_hwnd and prev_hwnd != hwnd and win32gui.IsWindow(prev_hwnd):
-            win32gui.SetForegroundWindow(prev_hwnd)
+    except Exception as e:
+        if not ctrlr_sent:
+            log(f'[MT4] keybd_event 失敗: {e}')
+    finally:
+        # SetForegroundWindow / AttachThreadInput のクリーンアップ
+        # 失敗してもスキップしない（二重 Ctrl+R を防ぐために必ず実行）
+        try:
+            if prev_hwnd and prev_hwnd != hwnd and win32gui.IsWindow(prev_hwnd):
+                win32gui.SetForegroundWindow(prev_hwnd)
+        except Exception:
+            pass
         time.sleep(0.05)
+        try:
+            if attached_fg:
+                ctypes.windll.user32.AttachThreadInput(our_tid, fg_tid, False)
+        except Exception:
+            pass
+        try:
+            if attached_tgt:
+                ctypes.windll.user32.AttachThreadInput(our_tid, target_tid, False)
+        except Exception:
+            pass
 
-        if attached_fg:
-            ctypes.windll.user32.AttachThreadInput(our_tid, fg_tid, False)
-        if attached_tgt:
-            ctypes.windll.user32.AttachThreadInput(our_tid, target_tid, False)
-
+    if ctrlr_sent:
         log('[MT4] テスタートグル: AttachThreadInput + keybd_event (Ctrl+R)')
         return True
-    except Exception as e:
-        log(f'[MT4] keybd_event 失敗: {e}')
 
     # 方法3: 最終フォールバック (フォーカスを奪う)
     log('[MT4] テスタートグル: フォールバック set_focus + type_keys')
@@ -1027,7 +571,7 @@ def _launch_mt4_session(model: str = TESTER_MODEL_FAST):
         raise RuntimeError('MT4 ウィンドウが見つかりません（起動タイムアウト）')
 
     time.sleep(15)
-    import win32gui, win32con
+    import win32gui
     _prev_fg_init = win32gui.GetForegroundWindow()
     app.top_window().set_focus()
     time.sleep(0.3)
@@ -1121,7 +665,7 @@ def _run_single_test(app, params: dict) -> dict:
             _toggle_tester_bg(app)
             log('[MT4] テスター閉じる')
             # 実際に閉じたか確認 (最大 3 秒)
-            for _chk in range(6):
+            for _ in range(6):
                 time.sleep(0.5)
                 if _collect_tester_controls(app)['start'] is None:
                     log('[MT4] テスター閉じる確認')
@@ -1130,9 +674,15 @@ def _run_single_test(app, params: dict) -> dict:
                 # トグルが効いていない → set_focus フォールバックで確実に閉じる
                 log('[警告] テスターが閉じない → set_focus フォールバックで強制閉じ')
                 _prev_fg_fb = win32gui.GetForegroundWindow()
-                app.top_window().set_focus()
+                try:
+                    app.top_window().set_focus()
+                except Exception:
+                    pass
                 time.sleep(0.2)
-                app.top_window().type_keys('^r')
+                try:
+                    app.top_window().type_keys('^r')
+                except Exception:
+                    pass
                 _restore_fg(_prev_fg_fb)
                 time.sleep(1.5)
 
@@ -1182,10 +732,9 @@ def _run_single_test(app, params: dict) -> dict:
         log('[MT4] Start ボタンが見つかりません（30秒タイムアウト）')
         return zero
 
-    # 4. テスト開始前のレポートファイルの更新時刻を記録
+    # 4. テスト開始前のログ位置を記録
     tester_log      = TESTER_DIR / 'logs' / f'{datetime.now().strftime("%Y%m%d")}.log'
     log_size_before = tester_log.stat().st_size if tester_log.exists() else 0
-    rpt_mtime_before = RPT_PATH.stat().st_mtime if RPT_PATH.exists() else 0.0
 
     # 5. Start クリック (BM_CLICK で MT4 がフォーカスを奪うため直後に復元)
     time.sleep(0.5)
@@ -1194,42 +743,41 @@ def _run_single_test(app, params: dict) -> dict:
     _restore_fg(_prev_fg_click)
     log('[MT4] Start → テスト実行中...')
 
-    # 6. テスト完了まで待機（ログファイルの変化を監視）
-    last_log_size = log_size_before
-    last_change_t = time.time()
-    test_started  = False
-    QUIET_SECS    = 15
-    MAX_WAIT      = 300  # 始値のみモードは ~6秒/回
+    # 6. テスト完了まで待機
+    # テスターログに "processed in" 行が現れたら即座に完了と判定する。
+    # QUIET_SECS 待ちを廃止することで 1 回あたり ~15 秒の無駄を解消。
+    MAX_WAIT     = 300
+    start_t      = time.time()
+    test_started = False
 
-    deadline = time.time() + MAX_WAIT
-    while time.time() < deadline:
-        cur_size = tester_log.stat().st_size if tester_log.exists() else last_log_size
-        if cur_size != last_log_size:
-            if not test_started:
-                test_started = True
-            last_log_size = cur_size
-            last_change_t = time.time()
-        elif test_started and (time.time() - last_change_t) > QUIET_SECS:
-            break
-        elif not test_started and (time.time() - last_change_t) > 60:
+    while time.time() - start_t < MAX_WAIT:
+        time.sleep(0.5)
+        try:
+            cur_size = tester_log.stat().st_size if tester_log.exists() else 0
+        except Exception:
+            cur_size = log_size_before
+
+        if cur_size > log_size_before:
+            test_started = True
+            try:
+                with open(tester_log, 'rb') as f:
+                    f.seek(log_size_before)
+                    chunk = f.read(cur_size - log_size_before)
+                if b'processed in' in chunk:
+                    log('[MT4] テスト完了 ("processed in" 検出)')
+                    time.sleep(2.0)  # MT4 が結果 UI を更新し終えてから Ctrl+R を受け付けるまで待つ
+                    break
+            except Exception:
+                pass
+        elif not test_started and (time.time() - start_t) > 60:
             log('[警告] テスト未開始 (60秒タイムアウト)')
             return zero
-        time.sleep(1)
     else:
         log(f'[警告] テストが {MAX_WAIT} 秒以内に完了しませんでした')
         return zero
 
-    # 7. MT4 が HTML レポートを書き込むまで待機（最大 30 秒）
-    log('[MT4] テスト完了 → HTMLレポート待機中...')
-    for _ in range(30):
-        if RPT_PATH.exists() and RPT_PATH.stat().st_mtime > rpt_mtime_before:
-            break
-        time.sleep(1)
-    else:
-        log('[警告] HTMLレポートが更新されませんでした（レポートなしで続行）')
-
-    # 8. MT4 の HTML レポートを解析（自前の損益計算は行わない）
-    metrics = _parse_mt4_report()
+    # 7. テスターログを解析してメトリクスを取得（HTML レポート不要）
+    metrics = _parse_tester_log(tester_log, log_size_before)
     if not metrics:
         metrics = {
             'profit_factor': 0.0, 'net_profit': 0.0, 'max_drawdown': 0.0,
@@ -1288,14 +836,14 @@ def run_mt4_backtest(params: dict, fast_mode: bool = True) -> dict:
 # ===== 遺伝的アルゴリズム =====
 
 # GA 設定
-GA_POP_SIZE   = 5   # 1世代の個体数  ※動作確認用（本番は50）
-GA_N_GEN      = 10    # 最大世代数     ※動作確認用（本番は100）
+GA_POP_SIZE   = 50   # 1世代の個体数  ※動作確認用（本番は50）
+GA_N_GEN      = 100    # 最大世代数     ※動作確認用（本番は100）
 GA_ELITE_N    = 10   # エリート継承数（上位N体をそのまま次世代へ）
 GA_N_CROSS    = 30   # 交叉で生成する個体数
 GA_N_RANDOM   = 10   # ランダム新規個体数（多様性維持）
 GA_MUT_RATE   = 0.5  # 突然変異率（1遺伝子あたりの変化確率）（デフォルト：0.2）
 GA_TOP_PARENT = 20   # 交叉に使う親の候補数（上位N体から選ぶ）
-GA_PATIENCE   = 1    # ベスト更新なしがこの世代数続いたら早期終了（デフォルト：8）
+GA_PATIENCE   = 8    # ベスト更新なしがこの世代数続いたら早期終了（デフォルト：8）
 
 
 def _random_individual(grid: dict) -> dict:
@@ -1333,8 +881,11 @@ def _score_results(results: list) -> None:
     max_np  = max((v for v in np_vals if v > 0), default=1.0)
     max_tr  = max(tr_vals, default=1.0) or 1.0
     for r, np_val, tr_val in zip(results, np_vals, tr_vals):
-        r['composite_score'] = (SCORE_WEIGHT_NET_PROFIT   * max(np_val, 0) / max_np
-                              + SCORE_WEIGHT_TOTAL_TRADES  * tr_val         / max_tr)
+        if tr_val < MIN_TRADES:
+            r['composite_score'] = 0.0
+        else:
+            r['composite_score'] = (SCORE_WEIGHT_NET_PROFIT   * max(np_val, 0) / max_np
+                                  + SCORE_WEIGHT_TOTAL_TRADES  * tr_val         / max_tr)
 
 
 def _run_evolve(grid: dict, label: str,
@@ -1401,8 +952,11 @@ def _run_evolve(grid: dict, label: str,
         max_tr  = max(tr_vals, default=1.0) or 1.0
         scored  = []
         for (data, ind), np_val, tr_val in zip(gen_items, np_vals, tr_vals):
-            score = (SCORE_WEIGHT_NET_PROFIT   * max(np_val, 0) / max_np
-                   + SCORE_WEIGHT_TOTAL_TRADES  * tr_val         / max_tr)
+            if tr_val < MIN_TRADES:
+                score = 0.0
+            else:
+                score = (SCORE_WEIGHT_NET_PROFIT   * max(np_val, 0) / max_np
+                       + SCORE_WEIGHT_TOTAL_TRADES  * tr_val         / max_tr)
             scored.append((score, data, ind))
         scored.sort(key=lambda x: x[0], reverse=True)
 
