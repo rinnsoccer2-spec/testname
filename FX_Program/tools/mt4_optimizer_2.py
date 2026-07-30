@@ -1,0 +1,1601 @@
+#!/usr/bin/env python3
+"""
+MT4 EA パラメータ最適化スクリプト (Strategy Tester 直接実行版) — v2
+
+使用方法:
+  python mt4_optimizer_2.py -o evolve   -k PDX+SAR_0.0.2   # 遺伝的アルゴリズム最適化
+  python mt4_optimizer_2.py -o grid     -k PDX+SAR_0.0.2   # グリッドサーチ
+  python mt4_optimizer_2.py -o refine   -k PDX+SAR_0.0.2   # ベストパラメータ周辺絞り込み
+  python mt4_optimizer_2.py -o adaptive -k PDX+SAR_0.0.2   # アダプティブストップ最適化
+  python mt4_optimizer_2.py -o atr      -k PDX+SAR_0.0.2   # ATRフィルター最適化
+  python mt4_optimizer_2.py -o backtest -k PDX+SAR_0.0.2   # best_params.json で詳細バックテスト
+  python mt4_optimizer_2.py -o ablate   -k PDX+SAR_0.0.2   # Leave-one-out アブレーション
+
+  -k を省略した場合は EA_CONFIGS の先頭エントリを使用する。
+  新しい EA を追加するには EA_CONFIGS にエントリを追加すること。
+
+  v1 からの変更点:
+    - EA コンパイル自動化を追加。src/<key>.mq4 が存在する場合、実行前に
+      MT4 の Experts フォルダへ反映し metaeditor.exe でコンパイルする。
+    - ablate コマンドを追加。best_params.json の各パラメータを 1 つずつ
+      グリッド中央値に戻して再テストし、パラメータごとのスコア低下幅（因果的寄与度）を計測する。
+
+注意: 実行中は MT4 を手動で開かないこと（プロセス競合）。
+"""
+
+import subprocess
+import re
+import sys
+import csv
+import json
+import itertools
+import random
+from pathlib import Path
+from datetime import datetime
+
+# ===== パス設定 =====
+MT4_DATA    = Path(r"C:\Users\rinns\AppData\Roaming\MetaQuotes\Terminal\082F53F5881F3D6022DF806C3D307B50")
+RESULTS_DIR = Path(__file__).parent / "results"
+SRC_DIR     = Path(__file__).parent.parent / "src"  # EA の .mq4 ソース置き場
+
+
+# ===== EA 設定ファイル =====
+# EA ごとの設定は tools/configs/<EA名>.json に記述する。
+# 新しい EA を追加するには JSON ファイルを追加するだけでよい。
+CONFIGS_DIR     = Path(__file__).parent / "configs"
+_DEFAULT_EA_KEY = "PDX+SAR_0.0.2"
+
+# 起動時は空。_apply_ea_config() で JSON から読み込む。
+GRID: dict           = {}
+_INT_EA_PARAMS: set  = set()
+MAX_SAMPLES          = 100
+
+# ===== 評価スコア重み =====
+SCORE_WEIGHT_NET_PROFIT   = 0.7  # 純益の重み
+SCORE_WEIGHT_TOTAL_TRADES = 0.3  # 総トレード数の重み
+MIN_TRADES                = 360   # これ未満のトレード数は過学習とみなしスコア0
+
+# ===== MT4 テスター設定 =====
+MT4_EXE        = Path(r"C:\Program Files (x86)\XMTrading MT4\terminal.exe")
+METAEDITOR_EXE = Path(r"C:\Program Files (x86)\XMTrading MT4\metaeditor.exe")
+TERM_INI    = MT4_DATA / "config" / "terminal.ini"
+TESTER_DIR  = MT4_DATA / "tester"
+REPORTS_DIR = MT4_DATA / "reports"
+EA_FILE     = f"{_DEFAULT_EA_KEY}.ex4"
+RPT_NAME    = "py_opt_result"
+RPT_PATH    = REPORTS_DIR / f"{RPT_NAME}.htm"
+TESTER_INI  = TESTER_DIR / f"{_DEFAULT_EA_KEY}.ini"
+
+TESTER_FROM          = "2023.06.06"
+TESTER_TO            = "2026.06.05"
+TESTER_SYMBOL        = "GOLD"
+TESTER_PERIOD        = "15"    # M15
+TESTER_MODEL_FAST    = "1"     # コントロールポイント (Control Points): 全ティック判定EA用
+TESTER_MODEL_PRECISE = "1"     # コントロールポイント (Control Points): 最終検証用
+TESTER_SPREAD        = "current"
+TESTER_DEPOSIT       = 50000000  # 50M JPY: 残高不足を防ぐ
+
+# M5=1, M15=2, M30=3, H1=4, H4=5 (MT4 テスター Period コンボボックスのインデックス)
+PERIOD_INDEX_MAP = {'1': 0, '5': 1, '15': 2, '30': 3, '60': 4, '240': 5, '1440': 6}
+
+
+
+def log(msg: str):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+# ===== 出力 =====
+
+def print_report(data: dict, params: dict = None):
+    sep = '=' * 60
+    print(f'\n{sep}')
+    print('【バックテスト結果】')
+    if params:
+        print('【パラメータ】')
+        for k, v in params.items():
+            print(f'  {k}: {v}')
+    print(sep)
+    print(f"  純益              : {data.get('net_profit', 'N/A'):>10} JPY")
+    print(f"  プロフィットF     : {data.get('profit_factor', 'N/A')}")
+    print(f"  最大ドローダウン  : {data.get('max_drawdown', 'N/A'):>10} JPY")
+    print(f"  総トレード数      : {data.get('total_trades', 'N/A')}")
+
+    # 月平均取引数: monthly_trades があればそこから、なければ期間で割る
+    monthly = data.get('monthly_trades', {})
+    if monthly:
+        avg_monthly = sum(monthly.values()) / len(monthly)
+    else:
+        try:
+            tf = datetime.strptime(TESTER_FROM, '%Y.%m.%d')
+            tt = datetime.strptime(TESTER_TO,   '%Y.%m.%d')
+            n_months = (tt.year - tf.year) * 12 + (tt.month - tf.month) + 1
+            avg_monthly = (data.get('total_trades', 0) or 0) / n_months if n_months > 0 else None
+        except Exception:
+            avg_monthly = None
+    if avg_monthly is not None:
+        print(f"  月平均取引数      : {avg_monthly:>10.1f} 回/月")
+
+    print(f"  勝率              : {data.get('win_rate_pct', 'N/A')}%")
+    print(f"  平均勝ち          : {data.get('avg_win', 'N/A'):>10} JPY")
+    print(f"  平均負け          : {data.get('avg_loss', 'N/A'):>10} JPY")
+
+    if monthly:
+        print('\n【月次取引数】')
+        for month, count in monthly.items():
+            print(f'  {month}  :  {count:3d} 回')
+
+    if data.get('consec_loss_start_hour_dist'):
+        print('\n【連続負け開始時間帯 (サーバー時刻)】')
+        for h, cnt in sorted(data['consec_loss_start_hour_dist'].items(),
+                             key=lambda x: -x[1])[:5]:
+            print(f'  {h:02d}:00〜{h:02d}:59  :  {cnt} 回')
+
+    n = data.get('longest_consec_loss_count')
+    if n:
+        start = data.get('longest_consec_loss_start', '')
+        hours = data.get('longest_consec_loss_hours', [])
+        print(f'\n【最長連続負け】{n} 連敗  開始: {start}')
+        print(f'  時間帯: {[f"{h:02d}:xx" for h in hours]}')
+
+
+def save_results(results: list, prefix: str) -> Path:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    if results:
+        csv_path   = RESULTS_DIR / f'{prefix}_{ts}.csv'
+        param_keys = list(results[0]['params'].keys())
+        met_keys   = ['composite_score', 'net_profit', 'profit_factor', 'max_drawdown',
+                      'total_trades', 'win_rate_pct', 'avg_win', 'avg_loss',
+                      'longest_consec_loss_count']
+        with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+            w = csv.DictWriter(f, fieldnames=['rank'] + met_keys + param_keys,
+                               extrasaction='ignore')
+            w.writeheader()
+            for i, r in enumerate(results, 1):
+                row = {'rank': i}
+                row.update({k: r.get(k, '') for k in met_keys})
+                row.update(r['params'])
+                w.writerow(row)
+        log(f'CSV 保存: {csv_path}')
+
+    json_path = RESULTS_DIR / f'{prefix}_{ts}.json'
+    json_path.write_text(json.dumps(results, ensure_ascii=False, indent=2, default=str),
+                         encoding='utf-8')
+    log(f'JSON 保存: {json_path}')
+    return json_path
+
+
+# ===== EA コンパイル自動化 =====
+
+def _compile_ea(key: str) -> bool:
+    """src/<key>.mq4 を MT4 の Experts フォルダへ反映し metaeditor.exe でコンパイルする。
+
+    成否判定は終了コードではなく .ex4 の更新時刻で行う。
+    metaeditor.exe の終了コードはこの環境では成否と一致しないことを確認済み
+    （正常コンパイルで 1、構文エラーで 0 を返すケースがあった）。
+    src/<key>.mq4 が存在しない場合は何もせず True を返す（既存の .ex4 をそのまま使用）。
+    """
+    src_mq4 = SRC_DIR / f'{key}.mq4'
+    if not src_mq4.exists():
+        log(f'[コンパイル] {src_mq4} が見つからないためスキップ（既存の .ex4 をそのまま使用）')
+        return True
+
+    experts_dir = MT4_DATA / 'MQL4' / 'Experts'
+    dst_mq4     = experts_dir / f'{key}.mq4'
+    dst_ex4     = experts_dir / f'{key}.ex4'
+
+    if dst_mq4.exists() and dst_mq4.read_bytes() == src_mq4.read_bytes():
+        log(f'[コンパイル] {key}.mq4 に変更なし → コンパイルスキップ')
+        return True
+
+    experts_dir.mkdir(parents=True, exist_ok=True)
+    dst_mq4.write_bytes(src_mq4.read_bytes())
+    log(f'[コンパイル] {src_mq4} → {dst_mq4} に反映')
+
+    mtime_before = dst_ex4.stat().st_mtime if dst_ex4.exists() else 0
+    try:
+        subprocess.run(
+            [str(METAEDITOR_EXE), f'/compile:{dst_mq4}'],
+            cwd=METAEDITOR_EXE.parent, timeout=60,
+        )
+    except Exception as e:
+        log(f'[コンパイル] metaeditor.exe 実行失敗: {e}')
+        return False
+
+    ok = dst_ex4.exists() and dst_ex4.stat().st_mtime > mtime_before
+    if ok:
+        log(f'[コンパイル] 成功: {dst_ex4}')
+    else:
+        log(f'[エラー] コンパイル失敗の可能性: {dst_ex4} が更新されていません')
+    return ok
+
+
+# ===== MT4 テスター直接実行 =====
+
+def _write_ea_ini(params: dict):
+    """EA パラメータを MT4 tester/*.ini (XML形式) に書き込む"""
+    TESTER_DIR.mkdir(parents=True, exist_ok=True)
+    lines = [
+        '<common>',
+        'positions=2',
+        f'deposit={TESTER_DEPOSIT}',
+        'currency=JPY',
+        'fitnes=2',
+        'genetic=0',
+        '</common>',
+        '',
+        '<inputs>',
+    ]
+    for name, val in params.items():
+        if name in _INT_EA_PARAMS:
+            v = int(val)
+            lines += [
+                f'{name}={v}',
+                f'{name},F=0',
+                f'{name},1=0',
+                f'{name},2=0',
+                f'{name},3=0',
+            ]
+        else:
+            v = float(val)
+            lines += [
+                f'{name}={v:.8f}',
+                f'{name},F=0',
+                f'{name},1=0.00000000',
+                f'{name},2=0.00000000',
+                f'{name},3=0.00000000',
+            ]
+    lines.append('</inputs>')
+    TESTER_INI.write_text('\n'.join(lines), encoding='utf-8')
+
+
+def _update_tester_config(model: str = TESTER_MODEL_FAST):
+    """terminal.ini の [Tester] セクションをバックテスト用設定に更新する"""
+    content = TERM_INI.read_text(encoding='utf-8')
+    new_section = (
+        '[Tester]\n'
+        f'Expert={EA_FILE}\n'
+        f'Symbol={TESTER_SYMBOL}\n'
+        f'Period={TESTER_PERIOD}\n'
+        f'Model={model}\n'
+        f'FromDate={TESTER_FROM}\n'
+        f'ToDate={TESTER_TO}\n'
+        'Optimization=0\n'
+        f'Report={RPT_NAME}\n'
+        'ReplaceReport=1\n'
+        'ShutdownTerminal=0\n'
+        'VisualChart=0\n'
+        f'Spread={TESTER_SPREAD}\n'
+    )
+    # [Tester] セクション全体を置き換える（次のセクションまたは末尾まで）
+    new_content = re.sub(r'\[Tester\].*?(?=\n\[|\Z)', new_section,
+                         content, flags=re.DOTALL)
+    if '[Tester]' not in content:
+        new_content = content + '\n' + new_section
+    TERM_INI.write_text(new_content, encoding='utf-8')
+
+
+def _parse_tester_log(log_path: Path, pos_before: int) -> dict:
+    """テスターログ (cp932) を解析してメトリクスを返す。HTML レポートの代替。
+
+    シンボル判定:
+      - USDJPY 系 (symbol に JPY を含む): contract=100000, 損益は JPY のまま
+      - GOLD / XAUUSD 系: contract=100 oz, 損益は USD → JPY 換算 (固定レート)
+      GA の相対比較が目的なので固定レートで問題ない。
+    """
+    try:
+        with open(log_path, 'rb') as f:
+            f.seek(pos_before)
+            raw = f.read()
+        text = raw.decode('cp932', errors='replace')
+    except Exception as e:
+        log(f'[ログ解析] 読み込み失敗: {e}')
+        return {}
+
+    # シンボルを特定して contract_size / JPY 換算倍率を決定
+    sym_m = re.search(r'open #\d+ (?:buy|sell) [\d.]+ (\w+) at', text)
+    symbol = sym_m.group(1).upper() if sym_m else ''
+    if 'JPY' in symbol:
+        contract_size = 100_000.0
+        jpy_mult      = 1.0
+    elif 'GOLD' in symbol or 'XAU' in symbol:
+        contract_size = 100.0
+        jpy_mult      = 150.0  # 固定近似レート (最適化の相対比較用)
+    else:
+        contract_size = 100_000.0
+        jpy_mult      = 1.0
+
+    open_pat = re.compile(r'open #(\d+) (buy|sell) ([\d.]+) \w+ at ([\d.]+)')
+    tp_pat   = re.compile(r'Tester: take profit #(\d+) at ([\d.]+)')
+    sl_pat   = re.compile(r'Tester: stop loss #(\d+) at ([\d.]+)')
+    cls_pat  = re.compile(r'Tester: order #(\d+) is closed')
+
+    opens  = {}
+    closes = {}
+    for line in text.splitlines():
+        m = open_pat.search(line)
+        if m:
+            num, typ, lots, entry = m.groups()
+            opens[int(num)] = (typ, float(lots), float(entry))
+            continue
+        m = tp_pat.search(line) or sl_pat.search(line)
+        if m:
+            closes[int(m.group(1))] = float(m.group(2))
+            continue
+        m = cls_pat.search(line)
+        if m:
+            num = int(m.group(1))
+            if num in opens and num not in closes:
+                closes[num] = opens[num][2]  # テスト期間末クローズ = P&L 0
+
+    profits = []
+    for num, (typ, lots, entry) in opens.items():
+        if num not in closes:
+            continue
+        exit_p = closes[num]
+        mult   = lots * contract_size * jpy_mult
+        pnl    = (exit_p - entry) * mult if typ == 'buy' else (entry - exit_p) * mult
+        profits.append(pnl)
+
+    if not profits:
+        return {}
+
+    wins       = [p for p in profits if p > 0]
+    losses     = [p for p in profits if p <= 0]
+    gross_win  = sum(wins) if wins else 0.0
+    gross_loss = abs(sum(losses)) if losses else 0.0
+    pf         = gross_win / gross_loss if gross_loss > 0 else 9999.0
+    net_profit = gross_win - gross_loss
+
+    return {
+        'profit_factor': round(pf, 4),
+        'net_profit':    round(net_profit, 0),
+        'max_drawdown':  0.0,
+        'total_trades':  len(profits),
+        'win_rate_pct':  round(len(wins) / len(profits) * 100, 2),
+        'avg_win':       round(gross_win / len(wins) if wins else 0, 0),
+        'avg_loss':      round(sum(losses) / len(losses) if losses else 0, 0),
+    }
+
+
+
+
+def _cb_select(ctrl, index: int) -> None:
+    """ComboBox を SendMessage(CB_SETCURSEL) で直接選択する。
+
+    pywinauto の select() は 64-bit Python + 32-bit MT4 の組み合わせで失敗するため、
+    Win32 メッセージを直接送って回避する。
+    """
+    import win32gui
+    CB_SETCURSEL = 0x014E
+    result = win32gui.SendMessage(ctrl.handle, CB_SETCURSEL, index, 0)
+    if result == -1:
+        raise RuntimeError(f'CB_SETCURSEL index={index} failed (CB_ERR)')
+
+
+def _collect_tester_controls(app) -> dict:
+    """テスターパネル内のコントロールをまとめて収集して返す"""
+    found = {
+        'start':      None,   # Button "スタート"
+        'expert':     None,   # ComboBox EA名 (PDX+SAR_0.0.2)
+        'period':     None,   # ComboBox 期間 (M15 など)
+        'model':      None,   # ComboBox モデル
+        'date_start': None,   # SysDateTimePick32 開始日
+        'date_end':   None,   # SysDateTimePick32 終了日
+    }
+    # Period ComboBox に表示されうる文字列（表示中の期間名 or 空文字）
+    _PERIOD_STRS = frozenset({
+        'M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1', 'MN', '',
+        '1', '5', '15', '30', '60', '240', '1440',
+    })
+    # テスターパネル配下のみ対象とするため "テスター" パネルを先に探す
+    tester_root = [None]
+
+    def _find_tester_root(win, depth=0):
+        if tester_root[0]:
+            return
+        try:
+            for child in win.children():
+                if tester_root[0]:
+                    return
+                try:
+                    title = child.window_text().strip()
+                    cls   = child.class_name()
+                    if 'テスター' in title or cls == 'Afx:003A0000:b:00010003:00000000:00000000':
+                        if 'テスター' in title:
+                            tester_root[0] = child
+                            return
+                    if depth < 4:
+                        _find_tester_root(child, depth + 1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    for win in app.windows():
+        _find_tester_root(win)
+
+    root = tester_root[0] if tester_root[0] else app.top_window()
+    date_picks = []
+
+    def _collect(win, depth=0):
+        try:
+            for child in win.children():
+                try:
+                    cls  = child.class_name()
+                    text = child.window_text().strip()
+                    if cls == 'Button' and text in ('スタート', 'Start') and found['start'] is None:
+                        found['start'] = child
+                    elif cls == 'ComboBox':
+                        if any(kw in text for kw in ('全ティック', 'コントロールポイント', '始値のみ',
+                                                      'Every', 'Control', 'Open')):
+                            found['model'] = child
+                        elif EA_FILE.replace('.ex4', '') in text and found['expert'] is None:
+                            found['expert'] = child
+                        elif text in _PERIOD_STRS and found['period'] is None:
+                            found['period'] = child
+                    elif cls == 'SysDateTimePick32':
+                        date_picks.append(child)
+                    if depth < 5:
+                        _collect(child, depth + 1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    _collect(root)
+
+    # 開始日 / 終了日 は出現順に最初と2番目
+    if len(date_picks) >= 2:
+        found['date_start'] = date_picks[0]
+        found['date_end']   = date_picks[1]
+
+    return found
+
+
+
+
+
+_TESTER_TOGGLE_CMD: int = 0  # Strategy Tester トグルのメニューコマンドID (0=未取得)
+
+
+def _find_tester_toggle_cmd(hwnd: int) -> int:
+    """MT4 メニューから Strategy Tester のコマンドIDを探して返す (0=見つからず)"""
+    import win32gui, win32con
+    try:
+        menu = win32gui.GetMenu(hwnd)
+        if not menu:
+            log('[MT4] GetMenu()=NULL (カスタムメニューのため WM_KEYDOWN 方式を使用)')
+            return 0
+        for i in range(win32gui.GetMenuItemCount(menu)):
+            sub = win32gui.GetSubMenu(menu, i)
+            if not sub:
+                continue
+            for j in range(win32gui.GetMenuItemCount(sub)):
+                try:
+                    cmd_id = win32gui.GetMenuItemID(sub, j)
+                    if cmd_id <= 0:
+                        continue
+                    text = win32gui.GetMenuString(sub, j, win32con.MF_BYPOSITION)
+                    if any(kw in text for kw in ('テスター', 'Tester', 'tester', 'Strategy')):
+                        log(f'[MT4] Strategy Tester メニューID: {cmd_id}  ("{text}")')
+                        return cmd_id
+                except Exception:
+                    pass
+        log('[MT4] Strategy Tester メニュー項目が見つからず → WM_KEYDOWN 方式を使用')
+    except Exception as e:
+        log(f'[MT4] メニュー探索エラー: {e}')
+    return 0
+
+
+def _toggle_tester_bg(app) -> bool:
+    """フォーカスを最小限に抑えて Strategy Tester を開閉する。
+
+    優先順位:
+      1. WM_COMMAND (メニューコマンドID) — フォーカス不要
+      2. AttachThreadInput + keybd_event (Ctrl+R)
+         keybd_event は GetKeyState を更新するため MT4 が確実に Ctrl+R と認識する。
+         前面切替は ~50ms のみ。
+      3. set_focus + type_keys — 最終フォールバック (フォーカス奪取あり)
+    """
+    global _TESTER_TOGGLE_CMD
+    import win32gui, win32con, win32api, win32process, ctypes, time
+
+    hwnd = app.top_window().handle
+
+    # 方法1: WM_COMMAND (メニューコマンドID)
+    if _TESTER_TOGGLE_CMD == 0:
+        _TESTER_TOGGLE_CMD = _find_tester_toggle_cmd(hwnd)
+
+    if _TESTER_TOGGLE_CMD != 0:
+        win32gui.PostMessage(hwnd, win32con.WM_COMMAND, _TESTER_TOGGLE_CMD, 0)
+        log(f'[MT4] テスタートグル: WM_COMMAND (id={_TESTER_TOGGLE_CMD})')
+        return True
+
+    # 方法2: AttachThreadInput + keybd_event
+    # PostMessage(WM_KEYDOWN) は GetKeyState を更新しないため Ctrl+R が届かない。
+    # keybd_event はカーネルレベルで GetKeyState を更新するため確実。
+    #
+    # 設計: Ctrl+R 送信後の SetForegroundWindow 失敗は無視して True を返す。
+    # 失敗したまま方法3に落ちると二重 Ctrl+R でトグルが元に戻るため。
+    KEYEVENTF_KEYUP = 0x0002
+    VK_R = 0x52
+    prev_hwnd    = win32gui.GetForegroundWindow()
+    our_tid      = ctypes.windll.kernel32.GetCurrentThreadId()
+    target_tid   = win32process.GetWindowThreadProcessId(hwnd)[0]
+    fg_tid       = win32process.GetWindowThreadProcessId(prev_hwnd)[0] if prev_hwnd else 0
+    attached_fg  = False
+    attached_tgt = False
+    ctrlr_sent   = False
+    try:
+        if our_tid != fg_tid and fg_tid:
+            attached_fg  = bool(ctypes.windll.user32.AttachThreadInput(our_tid, fg_tid, True))
+        if our_tid != target_tid:
+            attached_tgt = bool(ctypes.windll.user32.AttachThreadInput(our_tid, target_tid, True))
+
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.08)
+
+        # Ctrl+R を keybd_event で送信 (GetKeyState が "押下中" になる)
+        win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+        win32api.keybd_event(VK_R, 0, 0, 0)
+        win32api.keybd_event(VK_R, 0, KEYEVENTF_KEYUP, 0)
+        win32api.keybd_event(win32con.VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        ctrlr_sent = True
+        time.sleep(0.08)
+    except Exception as e:
+        if not ctrlr_sent:
+            log(f'[MT4] keybd_event 失敗: {e}')
+    finally:
+        # SetForegroundWindow / AttachThreadInput のクリーンアップ
+        # 失敗してもスキップしない（二重 Ctrl+R を防ぐために必ず実行）
+        try:
+            if prev_hwnd and prev_hwnd != hwnd and win32gui.IsWindow(prev_hwnd):
+                win32gui.SetForegroundWindow(prev_hwnd)
+        except Exception:
+            pass
+        time.sleep(0.05)
+        try:
+            if attached_fg:
+                ctypes.windll.user32.AttachThreadInput(our_tid, fg_tid, False)
+        except Exception:
+            pass
+        try:
+            if attached_tgt:
+                ctypes.windll.user32.AttachThreadInput(our_tid, target_tid, False)
+        except Exception:
+            pass
+
+    if ctrlr_sent:
+        log('[MT4] テスタートグル: AttachThreadInput + keybd_event (Ctrl+R)')
+        return True
+
+    # 方法3: 最終フォールバック (フォーカスを奪う)
+    log('[MT4] テスタートグル: フォールバック set_focus + type_keys')
+    try:
+        _prev_fg_m3 = win32gui.GetForegroundWindow()
+        app.top_window().set_focus()
+        time.sleep(0.2)
+        app.top_window().type_keys('^r')
+        _restore_fg(_prev_fg_m3)
+        return True
+    except Exception as e:
+        log(f'[MT4] テスタートグル失敗: {e}')
+        return False
+
+
+def _launch_mt4_session(model: str = TESTER_MODEL_FAST):
+    """MT4 を起動してテスター UI の初期設定（期間・モデル・日付）を行い (proc, app) を返す。
+
+    Start は押さない。以降は _run_single_test() で繰り返しテストを実行できる。
+    """
+    import time
+    from pywinauto import Application, Desktop
+
+    _prevent_sleep()
+    _update_tester_config(model)
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not MT4_EXE.exists():
+        raise FileNotFoundError(f'MT4 が見つかりません: {MT4_EXE}')
+
+    proc = subprocess.Popen([str(MT4_EXE)])
+    log(f'[MT4] 起動 (PID={proc.pid})')
+
+    app = None
+    for _ in range(40):
+        time.sleep(1)
+        try:
+            for w in Desktop(backend='win32').windows():
+                try:
+                    title = w.window_text()
+                    if ('XMTrading' in title or 'MetaTrader' in title) and w.is_visible():
+                        app = Application(backend='win32').connect(handle=w.handle)
+                        log(f'[MT4] ウィンドウ検出: "{title}"')
+                        break
+                except Exception:
+                    pass
+            if app:
+                break
+        except Exception:
+            pass
+    if app is None:
+        proc.kill()
+        raise RuntimeError('MT4 ウィンドウが見つかりません（起動タイムアウト）')
+
+    time.sleep(15)
+    import win32gui
+    _prev_fg_init = win32gui.GetForegroundWindow()
+    app.top_window().set_focus()
+    time.sleep(0.3)
+    _restore_fg(_prev_fg_init)
+    time.sleep(0.5)
+
+    # 期間・モデル・日付を設定（Startは押さない）
+    PERIOD_INDEX = PERIOD_INDEX_MAP.get(TESTER_PERIOD, 2)
+    try:
+        model_index = int(model)
+    except ValueError:
+        model_index = 1
+
+    ctrl = _collect_tester_controls(app)
+    log(f'[MT4] コントロール収集: start={ctrl["start"] is not None} '
+        f'expert={ctrl["expert"] is not None} '
+        f'period={ctrl["period"] is not None} model={ctrl["model"] is not None} '
+        f'date_start={ctrl["date_start"] is not None} date_end={ctrl["date_end"] is not None}')
+
+    if ctrl['start'] is None:
+        proc.kill()
+        raise RuntimeError('テスターパネルが見つかりません')
+
+    for key, fn in [
+        ('period',     lambda: _cb_select(ctrl['period'], PERIOD_INDEX)),
+        ('model',      lambda: _cb_select(ctrl['model'],  model_index)),
+        ('date_start', lambda: ctrl['date_start'].set_time(
+            year=int(TESTER_FROM[:4]), month=int(TESTER_FROM[5:7]), day=int(TESTER_FROM[8:10]))),
+        ('date_end',   lambda: ctrl['date_end'].set_time(
+            year=int(TESTER_TO[:4]), month=int(TESTER_TO[5:7]), day=int(TESTER_TO[8:10]))),
+    ]:
+        if ctrl[key] is not None:
+            try:
+                fn()
+                time.sleep(0.3)
+            except Exception as e:
+                log(f'[MT4] {key} 設定スキップ: {e}')
+
+    log('[MT4] セッション準備完了')
+    return proc, app
+
+
+def _restore_fg(saved_hwnd: int) -> None:
+    """MT4 がフォアグラウンドを奪った後、saved_hwnd (ユーザーの作業ウインドウ) に戻す。
+
+    現フォアグラウンドのスレッドに AttachThreadInput することで
+    SetForegroundWindow の呼び出し権限を取得してから復元する。
+    """
+    import ctypes, win32gui, win32process
+    if not saved_hwnd or not win32gui.IsWindow(saved_hwnd):
+        return
+    cur = win32gui.GetForegroundWindow()
+    if cur == saved_hwnd:
+        return
+    try:
+        our_tid  = ctypes.windll.kernel32.GetCurrentThreadId()
+        cur_tid  = win32process.GetWindowThreadProcessId(cur)[0] if cur else 0
+        attached = False
+        if our_tid != cur_tid and cur_tid:
+            attached = bool(ctypes.windll.user32.AttachThreadInput(our_tid, cur_tid, True))
+        win32gui.SetForegroundWindow(saved_hwnd)
+        if attached:
+            ctypes.windll.user32.AttachThreadInput(our_tid, cur_tid, False)
+    except Exception:
+        pass
+
+
+def _run_single_test(app, params: dict) -> dict:
+    """既存の MT4 セッションで EA パラメータを更新し 1 回テストを実行してメトリクスを返す。
+
+    MT4 は閉じない。連続して呼び出すことで複数評価を同じセッションで実行できる。
+    Ctrl+R でテスターを閉じ→再開することで MT4 に ini を確実に再読み込みさせる。
+    """
+    import time, win32gui, win32con
+
+    zero = {
+        'profit_factor': 0.0, 'net_profit': 0.0, 'max_drawdown': 0.0,
+        'total_trades': 0, 'win_rate_pct': 0.0, 'avg_win': 0.0, 'avg_loss': 0.0,
+        'params': params,
+    }
+
+    # 1. EA ini を書き込む
+    _write_ea_ini(params)
+
+    # 2. テスターを閉じ→再開 (ini 再読み込みトリガー)
+    #    MT4 は ini を「テスターパネルを開くとき」に読み込む。
+    #    確実に閉じたことを確認してから開く。
+    try:
+        # テスターが開いていれば先に閉じる
+        if _collect_tester_controls(app)['start'] is not None:
+            _toggle_tester_bg(app)
+            log('[MT4] テスター閉じる')
+            # 実際に閉じたか確認 (最大 3 秒)
+            for _ in range(6):
+                time.sleep(0.5)
+                if _collect_tester_controls(app)['start'] is None:
+                    log('[MT4] テスター閉じる確認')
+                    break
+            else:
+                # トグルが効いていない → set_focus フォールバックで確実に閉じる
+                log('[警告] テスターが閉じない → set_focus フォールバックで強制閉じ')
+                _prev_fg_fb = win32gui.GetForegroundWindow()
+                try:
+                    app.top_window().set_focus()
+                except Exception:
+                    pass
+                time.sleep(0.2)
+                try:
+                    app.top_window().type_keys('^r')
+                except Exception:
+                    pass
+                _restore_fg(_prev_fg_fb)
+                time.sleep(1.5)
+
+        # テスターを開く (ini 再読み込み)
+        _toggle_tester_bg(app)
+        log('[MT4] テスター開く → ini 再読み込み')
+        time.sleep(3.5)
+    except Exception as e:
+        log(f'[MT4] テスター再起動スキップ: {e}')
+
+    # 3. Start ボタンが出現するまでポーリングし、期間・モデル・日付を設定
+    PERIOD_INDEX = PERIOD_INDEX_MAP.get(TESTER_PERIOD, 2)
+    try:
+        model_index = int(TESTER_MODEL_FAST)
+    except ValueError:
+        model_index = 2
+
+    start_hwnd  = None
+    _prev_fg_op = win32gui.GetForegroundWindow()  # コントロール操作前のフォーカス保存
+    for attempt in range(30):
+        ctrl = _collect_tester_controls(app)
+        if ctrl['start'] is not None:
+            log(f'[MT4] Start ボタン確認 (試行{attempt + 1}回目)')
+            for key, fn in [
+                ('period',     lambda: _cb_select(ctrl['period'], PERIOD_INDEX)),
+                ('model',      lambda: _cb_select(ctrl['model'],  model_index)),
+                ('date_start', lambda: ctrl['date_start'].set_time(
+                    year=int(TESTER_FROM[:4]), month=int(TESTER_FROM[5:7]), day=int(TESTER_FROM[8:10]))),
+                ('date_end',   lambda: ctrl['date_end'].set_time(
+                    year=int(TESTER_TO[:4]), month=int(TESTER_TO[5:7]), day=int(TESTER_TO[8:10]))),
+            ]:
+                if ctrl[key] is not None:
+                    try:
+                        fn()
+                        time.sleep(0.3)
+                    except Exception as e:
+                        log(f'[MT4] {key} 設定スキップ: {e}')
+            # コントロール設定後に MT4 がフォーカスを奪っていた場合は復元
+            _restore_fg(_prev_fg_op)
+            start_hwnd = ctrl['start'].handle
+            break
+        time.sleep(1)
+        if attempt % 5 == 4:
+            log(f'[MT4] Start ボタン待機中... ({attempt + 1}/30)')
+
+    if start_hwnd is None:
+        log('[MT4] Start ボタンが見つかりません（30秒タイムアウト）')
+        return zero
+
+    # 4. テスト開始前のログ位置を記録
+    tester_log      = TESTER_DIR / 'logs' / f'{datetime.now().strftime("%Y%m%d")}.log'
+    log_size_before = tester_log.stat().st_size if tester_log.exists() else 0
+
+    # 5. Start クリック (BM_CLICK で MT4 がフォーカスを奪うため直後に復元)
+    time.sleep(0.5)
+    _prev_fg_click = win32gui.GetForegroundWindow()
+    win32gui.SendMessage(start_hwnd, win32con.BM_CLICK, 0, 0)
+    _restore_fg(_prev_fg_click)
+    log('[MT4] Start → テスト実行中...')
+
+    # 6. テスト完了まで待機
+    # テスターログに "processed in" 行が現れたら即座に完了と判定する。
+    # QUIET_SECS 待ちを廃止することで 1 回あたり ~15 秒の無駄を解消。
+    MAX_WAIT     = 300
+    start_t      = time.time()
+    test_started = False
+
+    while time.time() - start_t < MAX_WAIT:
+        time.sleep(0.5)
+        try:
+            cur_size = tester_log.stat().st_size if tester_log.exists() else 0
+        except Exception:
+            cur_size = log_size_before
+
+        if cur_size > log_size_before:
+            test_started = True
+            try:
+                with open(tester_log, 'rb') as f:
+                    f.seek(log_size_before)
+                    chunk = f.read(cur_size - log_size_before)
+                if b'processed in' in chunk:
+                    log('[MT4] テスト完了 ("processed in" 検出)')
+                    time.sleep(2.0)  # MT4 が結果 UI を更新し終えてから Ctrl+R を受け付けるまで待つ
+                    break
+            except Exception:
+                pass
+        elif not test_started and (time.time() - start_t) > 60:
+            log('[警告] テスト未開始 (60秒タイムアウト)')
+            return zero
+    else:
+        log(f'[警告] テストが {MAX_WAIT} 秒以内に完了しませんでした')
+        return zero
+
+    # 7. テスターログを解析してメトリクスを取得（HTML レポート不要）
+    metrics = _parse_tester_log(tester_log, log_size_before)
+    if not metrics:
+        metrics = {
+            'profit_factor': 0.0, 'net_profit': 0.0, 'max_drawdown': 0.0,
+            'total_trades': 0, 'win_rate_pct': 0.0, 'avg_win': 0.0, 'avg_loss': 0.0,
+        }
+    metrics['params'] = params
+    log(f'[MT4]   → PF={metrics["profit_factor"]:.4f}  '
+        f'純益={metrics["net_profit"]:,.0f}  '
+        f'取引={metrics["total_trades"]}')
+    return metrics
+
+
+def _prevent_sleep():
+    """最適化中にディスプレイスリープ・システムスリープを抑制する"""
+    import ctypes
+    ES_CONTINUOUS       = 0x80000000
+    ES_SYSTEM_REQUIRED  = 0x00000001  # システムスリープ抑制
+    ES_DISPLAY_REQUIRED = 0x00000002  # ディスプレイオフ抑制
+    ctypes.windll.kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+    log('[MT4] スリープ抑制: ON (ディスプレイ・システムスリープを無効化)')
+
+
+def _restore_sleep():
+    """スリープ抑制を解除してOSのデフォルト設定に戻す"""
+    import ctypes
+    ES_CONTINUOUS = 0x80000000
+    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+    log('[MT4] スリープ抑制: OFF (OS デフォルトに戻す)')
+
+
+def _close_mt4(proc) -> None:
+    """MT4 プロセスを安全に終了する"""
+    _restore_sleep()
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=15)
+        except Exception:
+            proc.kill()
+
+
+def run_mt4_backtest(params: dict, fast_mode: bool = True) -> dict:
+    """スタンドアロン: MT4 を起動→テスト実行→MT4 を開いたまま返す（backtest コマンド用）
+
+    Results/Graph タブを確認できるよう MT4 は終了しない。
+    """
+    model = TESTER_MODEL_FAST if fast_mode else TESTER_MODEL_PRECISE
+    _, app = _launch_mt4_session(model)
+    result = _run_single_test(app, params)
+    _restore_sleep()
+    log('[MT4] バックテスト完了。MT4 は開いたまま終了します（Results/Graph タブを確認してください）')
+    return result
+
+
+# ===== 遺伝的アルゴリズム =====
+
+# GA 設定
+GA_POP_SIZE   = 50   # 1世代の個体数  ※動作確認用（本番は50）
+GA_N_GEN      = 100    # 最大世代数     ※動作確認用（本番は100）
+GA_ELITE_N    = 10   # エリート継承数（上位N体をそのまま次世代へ）
+GA_N_CROSS    = 30   # 交叉で生成する個体数
+GA_N_RANDOM   = 10   # ランダム新規個体数（多様性維持）
+GA_MUT_RATE   = 0.5  # 突然変異率（1遺伝子あたりの変化確率）（デフォルト：0.2）
+GA_TOP_PARENT = 20   # 交叉に使う親の候補数（上位N体から選ぶ）
+GA_PATIENCE   = 8    # ベスト更新なしがこの世代数続いたら早期終了（デフォルト：8）
+
+
+def _random_individual(grid: dict) -> dict:
+    """grid から各パラメータをランダムに選んで個体を生成する"""
+    return {k: random.choice(v) for k, v in grid.items()}
+
+
+def _crossover(p1: dict, p2: dict) -> dict:
+    """一様交叉: 各遺伝子を 50% の確率で p1 か p2 から継承する"""
+    return {k: random.choice([p1[k], p2[k]]) for k in p1}
+
+
+def _mutate(ind: dict, grid: dict, rate: float = GA_MUT_RATE) -> dict:
+    """突然変異: 各遺伝子を rate の確率で grid 内のランダム値に置換する"""
+    result = dict(ind)
+    for k, choices in grid.items():
+        if random.random() < rate:
+            result[k] = random.choice(choices)
+    return result
+
+
+def _ind_key(ind: dict) -> tuple:
+    """個体を辞書順ソートしたタプルに変換（重複検出・キャッシュキー用）"""
+    return tuple(sorted(ind.items()))
+
+
+def _score_results(results: list) -> None:
+    """results リストに composite_score を追加する（in-place）。
+
+    純益・トレード数をリスト内の最大値で正規化し、重み付き合計を計算する。
+    純益が負のものはスコア 0 として扱う。
+    """
+    np_vals = [r.get('net_profit', 0) or 0 for r in results]
+    tr_vals = [r.get('total_trades', 0) or 0 for r in results]
+    max_np  = max((v for v in np_vals if v > 0), default=1.0)
+    max_tr  = max(tr_vals, default=1.0) or 1.0
+    for r, np_val, tr_val in zip(results, np_vals, tr_vals):
+        if tr_val < MIN_TRADES:
+            r['composite_score'] = 0.0
+        else:
+            r['composite_score'] = (SCORE_WEIGHT_NET_PROFIT   * max(np_val, 0) / max_np
+                                  + SCORE_WEIGHT_TOTAL_TRADES  * tr_val         / max_tr)
+
+
+def _run_evolve(grid: dict, label: str,
+                evaluator=None,
+                n_gen: int = GA_N_GEN, pop_size: int = GA_POP_SIZE,
+                patience: int = GA_PATIENCE,
+                seed_results: list = None) -> list:
+    """GA の共通ループ。grid で探索空間を指定し、結果リストを返す。
+
+    evaluator:    params -> dict の評価関数。None の場合は run_mt4_backtest を使う。
+    seed_results: チェックポイントから読み込んだ評価済み結果リスト。
+                  渡すとキャッシュに引き継ぎ、上位個体を初期集団の種に使う。
+    """
+    if evaluator is None:
+        evaluator = run_mt4_backtest
+
+    elite_n    = GA_ELITE_N
+    n_cross    = GA_N_CROSS
+    n_random   = pop_size - elite_n - n_cross
+    top_parent = GA_TOP_PARENT
+
+    log(f'GA設定: 最大{n_gen}世代 × {pop_size}個体  '
+        f'エリート={elite_n}  交叉={n_cross}  ランダム={n_random}  '
+        f'突然変異率={GA_MUT_RATE}  early_stop_patience={patience}')
+
+    # チェックポイントがあればキャッシュと初期集団を復元
+    cache: dict   = {}
+    all_results: list = []
+    if seed_results:
+        for r in seed_results:
+            if 'params' in r:
+                cache[_ind_key(r['params'])] = r
+        all_results = list(seed_results)
+        # 上位 elite_n 体を初期集団の種に、残りはランダムで多様性を確保
+        _score_results(seed_results)
+        sorted_seeds = sorted(seed_results, key=lambda x: x.get('composite_score', 0), reverse=True)
+        seed_inds    = [r['params'] for r in sorted_seeds[:elite_n]]
+        population   = seed_inds + [_random_individual(grid) for _ in range(pop_size - len(seed_inds))]
+        log(f'チェックポイント引き継ぎ: 評価済み {len(cache)} 件 / 初期種 {len(seed_inds)} 体')
+    else:
+        population = [_random_individual(grid) for _ in range(pop_size)]
+
+    best_score = -1.0
+    no_improve = 0
+
+    for gen in range(1, n_gen + 1):
+
+        # --- 評価 ---
+        new_evals = 0
+        gen_items: list = []
+        for i, ind in enumerate(population):
+            key = _ind_key(ind)
+            if key not in cache:
+                log(f'  [{label}] 第{gen}世代 個体{i+1}/{pop_size} 評価中...')
+                data       = evaluator(ind)
+                cache[key] = data
+                new_evals += 1
+            gen_items.append((cache[key], ind))
+
+        # 世代内で正規化してスコア計算 (純益 70% + トレード数 30%)
+        np_vals = [d.get('net_profit', 0) or 0 for d, _ in gen_items]
+        tr_vals = [d.get('total_trades', 0) or 0 for d, _ in gen_items]
+        max_np  = max((v for v in np_vals if v > 0), default=1.0)
+        max_tr  = max(tr_vals, default=1.0) or 1.0
+        scored  = []
+        for (data, ind), np_val, tr_val in zip(gen_items, np_vals, tr_vals):
+            if tr_val < MIN_TRADES:
+                score = 0.0
+            else:
+                score = (SCORE_WEIGHT_NET_PROFIT   * max(np_val, 0) / max_np
+                       + SCORE_WEIGHT_TOTAL_TRADES  * tr_val         / max_tr)
+            scored.append((score, data, ind))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # --- 世代ログ ---
+        gen_score = scored[0][0]
+        gen_np    = scored[0][1].get('net_profit', 0)
+        gen_tr    = scored[0][1].get('total_trades', 0)
+        star      = ''
+        if gen_score > best_score:
+            best_score = gen_score
+            no_improve = 0
+            star       = '  ★ ベスト更新'
+        else:
+            no_improve += 1
+            star        = f'  (改善なし {no_improve}/{patience})'
+        log(f'[{label} 第{gen:2d}世代] スコア={gen_score:.4f}  純益={gen_np:>8,.0f}JPY'
+            f'  取引={gen_tr}  新規={new_evals:2d}  累計={len(cache)}{star}')
+
+        all_results.extend([s[1] for s in scored])
+
+        # --- チェックポイント保存 (中断してもここまでの最善が残る) ---
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        # best_params.json を毎世代上書き
+        best_params_path = RESULTS_DIR / 'best_params.json'
+        best_params_path.write_text(
+            json.dumps(scored[0][2], ensure_ascii=False, indent=2),
+            encoding='utf-8')
+        # ユニーク結果のチェックポイントを保存
+        ckpt_seen: set   = set()
+        ckpt_unique: list = []
+        for r in all_results:
+            k = _ind_key(r['params'])
+            if k not in ckpt_seen:
+                ckpt_seen.add(k)
+                ckpt_unique.append(r)
+        _score_results(ckpt_unique)
+        ckpt_unique.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
+        ckpt_path = RESULTS_DIR / f'{label}_checkpoint.json'
+        ckpt_path.write_text(
+            json.dumps(ckpt_unique, ensure_ascii=False, indent=2, default=str),
+            encoding='utf-8')
+
+        if gen == n_gen:
+            log(f'[{label}] 最大世代数 ({n_gen}) に到達。終了。')
+            break
+        if no_improve >= patience:
+            log(f'[{label}] {patience}世代連続でベスト未更新 → Early Stopping (第{gen}世代)。')
+            break
+
+        # --- 次世代生成 ---
+        elites  = [s[2] for s in scored[:elite_n]]
+        parents = [s[2] for s in scored[:top_parent]]
+
+        next_pop = list(elites)
+        while len(next_pop) < elite_n + n_cross:
+            p1, p2 = random.sample(parents, 2)
+            next_pop.append(_mutate(_crossover(p1, p2), grid))
+        for _ in range(n_random):
+            next_pop.append(_random_individual(grid))
+
+        population = next_pop
+
+    # ユニーク化・スコア降順ソート
+    seen: set  = set()
+    unique: list = []
+    for r in all_results:
+        k = _ind_key(r['params'])
+        if k not in seen:
+            seen.add(k)
+            unique.append(r)
+    _score_results(unique)
+    unique.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
+    return unique
+
+
+def cmd_evolve():
+    """遺伝的アルゴリズムでパラメータ最適化する（全グリッド対象）
+
+    evolve_checkpoint.json が存在する場合は自動的に引き継いで続きから再開する。
+    最初からやり直したい場合は evolve_checkpoint.json を削除してから実行すること。
+    """
+    # チェックポイントがあれば引き継ぐ
+    ckpt_path    = RESULTS_DIR / 'evolve_checkpoint.json'
+    seed_results = None
+    if ckpt_path.exists():
+        try:
+            seed_results = json.loads(ckpt_path.read_text(encoding='utf-8'))
+            log(f'チェックポイント検出: {len(seed_results)} 件を引き継いで再開します')
+            log(f'  (最初からやり直す場合は {ckpt_path} を削除してください)')
+        except Exception as e:
+            log(f'チェックポイント読み込みスキップ: {e}')
+
+    proc, app = _launch_mt4_session(TESTER_MODEL_FAST)
+    try:
+        evaluator = lambda p: _run_single_test(app, p)
+        unique = _run_evolve(GRID, label='evolve', evaluator=evaluator,
+                             seed_results=seed_results)
+    finally:
+        _close_mt4(proc)
+
+    log(f'\n=== 進化完了: {len(unique)} ユニーク組み合わせを評価 ===')
+    print_report(unique[0], unique[0]['params'])
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    best_path = RESULTS_DIR / 'best_params.json'
+    best_path.write_text(
+        json.dumps(unique[0]['params'], ensure_ascii=False, indent=2),
+        encoding='utf-8')
+    log(f'ベストパラメータ保存: {best_path}')
+    save_results(unique, 'evolve_results')
+
+
+def cmd_refine():
+    """ベストパラメータ周辺の絞り込みグリッドで再探索する
+
+    各パラメータを GRID の中でベスト値の前後 ±1 ステップに絞り、
+    さらに数値パラメータには中間値を追加して細かく探索する。
+    """
+    best_path = RESULTS_DIR / 'best_params.json'
+    if not best_path.exists():
+        log('[エラー] best_params.json が見つかりません。先に evolve を実行してください。')
+        sys.exit(1)
+
+    best = json.loads(best_path.read_text(encoding='utf-8'))
+    log(f'ベストパラメータ: {best}')
+
+    def neighbors(vals: list, best_val, n: int = 1) -> list:
+        """vals の中で best_val に最も近いインデックスの前後 n 個を返す"""
+        closest = min(vals, key=lambda x: abs(x - best_val))
+        idx = vals.index(closest)
+        lo  = max(0, idx - n)
+        hi  = min(len(vals) - 1, idx + n)
+        return vals[lo:hi+1]
+
+    def midpoints(vals: list) -> list:
+        """隣り合う値の中間値を追加して返す"""
+        result = list(vals)
+        for a, b in zip(vals, vals[1:]):
+            mid = round((a + b) / 2, 8)
+            if mid not in result:
+                result.append(mid)
+        return sorted(set(result))
+
+    # ベスト値の ±1 ステップに絞り、数値パラメータは中間値も追加
+    numeric_params = {'ADX_Threshold', 'SAR_Step', 'SAR_Max', 'StopLoss', 'TakeProfit'}
+    refined: dict = {}
+    for k in GRID:
+        base = neighbors(GRID[k], best[k], n=1)
+        refined[k] = midpoints(base) if k in numeric_params else base
+
+    total = 1
+    for v in refined.values():
+        total *= len(v)
+
+    log(f'\n絞り込みグリッド ({total} 組み合わせ):')
+    for k, v in refined.items():
+        log(f'  {k}: {v}')
+
+    # 世代数を増やして細かく探索
+    proc, app = _launch_mt4_session(TESTER_MODEL_FAST)
+    try:
+        evaluator = lambda p: _run_single_test(app, p)
+        unique = _run_evolve(refined, label='refine', n_gen=40, patience=15, evaluator=evaluator)
+    finally:
+        _close_mt4(proc)
+
+    log(f'\n=== 再探索完了: {len(unique)} ユニーク組み合わせを評価 ===')
+    print_report(unique[0], unique[0]['params'])
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    best_path.write_text(
+        json.dumps(unique[0]['params'], ensure_ascii=False, indent=2),
+        encoding='utf-8')
+    log(f'ベストパラメータ保存: {best_path}')
+    save_results(unique, 'refine_results')
+
+
+def cmd_adaptive():
+    """適応型停止パラメータを最適化する（ベストパラメータに重ねて全探索）
+
+    AdaptiveWindow / AdaptivePauseWR / AdaptivePauseHours の
+    全組み合わせ (27通り) を試し、ベストパラメータとして保存する。
+    """
+    best_path = RESULTS_DIR / 'best_params.json'
+    if not best_path.exists():
+        log('[エラー] best_params.json が見つかりません。先に evolve/refine を実行してください。')
+        sys.exit(1)
+
+    base = json.loads(best_path.read_text(encoding='utf-8'))
+    log(f'ベースパラメータ: {base}')
+
+    # 適応型停止パラメータの探索グリッド
+    adap_grid = {
+        'AdaptiveWindow':     [10, 15, 20],              # 監視ウィンドウ (トレード数)
+        'AdaptivePauseWR':    [0.15, 0.20, 0.25, 0.30], # 停止トリガー勝率
+        'AdaptivePauseHours': [24, 48, 72],              # 停止時間 (時間)
+    }
+
+    keys    = list(adap_grid.keys())
+    combos  = list(itertools.product(*[adap_grid[k] for k in keys]))
+    results = []
+    best_pf = -1.0
+
+    log(f'\n適応パラメータ探索: {len(combos)} 組み合わせ (全探索)\n')
+
+    proc, app = _launch_mt4_session(TESTER_MODEL_FAST)
+    try:
+        evaluator = lambda p: _run_single_test(app, p)
+
+        # ベースライン (適応停止なし) を最初に計算
+        baseline = evaluator(base)
+        log(f'\n[ベースライン (適応停止なし)]  '
+            f'PF={baseline["profit_factor"]:.4f}  '
+            f'純益={baseline["net_profit"]:,.0f}JPY')
+
+        for idx, combo in enumerate(combos, 1):
+            adap_params = dict(zip(keys, combo))
+            params      = {**base, **adap_params}
+
+            data = evaluator(params)
+            results.append(data)
+
+            pf   = data.get('profit_factor', 0) or 0
+            np_  = data.get('net_profit', 0) or 0
+            star = ''
+            if pf > best_pf:
+                best_pf = pf
+                star    = '  ★'
+            log(f'[{idx:2d}/{len(combos)}]'
+                f'  W={adap_params["AdaptiveWindow"]:2d}'
+                f'  WR<{adap_params["AdaptivePauseWR"]:.0%}'
+                f'  {adap_params["AdaptivePauseHours"]:2d}h停止'
+                f'  →  PF={pf:.4f}  純益={np_:>8,.0f}JPY{star}')
+    finally:
+        _close_mt4(proc)
+
+    _score_results(results)
+    results.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
+
+    log(f'\n=== 適応パラメータ最適化完了 ===')
+    log(f'ベースライン比較:')
+    log(f'  Before: PF={baseline["profit_factor"]:.4f}  '
+        f'純益={baseline["net_profit"]:,.0f}JPY')
+    best_r = results[0]
+    log(f'  After : PF={best_r["profit_factor"]:.4f}  '
+        f'純益={best_r["net_profit"]:,.0f}JPY')
+    print_report(best_r, best_r['params'])
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    best_path.write_text(
+        json.dumps(best_r['params'], ensure_ascii=False, indent=2),
+        encoding='utf-8')
+    log(f'ベストパラメータ保存: {best_path}')
+    save_results(results, 'adaptive_results')
+
+
+def cmd_atr():
+    """ATRフィルターパラメータを最適化する（ベストパラメータに重ねて全探索）
+
+    ATR_Short / ATR_Baseline / ATR_Multiplier の全27通りを試し、
+    ベースライン（フィルターなし）と比較してベストを保存する。
+    """
+    best_path = RESULTS_DIR / 'best_params.json'
+    if not best_path.exists():
+        log('[エラー] best_params.json が見つかりません。先に adaptive を実行してください。')
+        sys.exit(1)
+
+    base = json.loads(best_path.read_text(encoding='utf-8'))
+    log(f'ベースパラメータ: {base}')
+
+    atr_grid = {
+        'ATR_Short':      [10, 14, 20],     # 短期ATRの計算期間
+        'ATR_Baseline':   [50, 100, 200],   # 基準ATRの計算期間
+        'ATR_Multiplier': [1.3, 1.5, 2.0],  # 停止閾値 (短期/基準 がこの値を超えたら禁止)
+    }
+
+    keys   = list(atr_grid.keys())
+    combos = list(itertools.product(*[atr_grid[k] for k in keys]))
+    results: list = []
+    best_pf = -1.0
+
+    log(f'\nATRフィルター探索: {len(combos)} 組み合わせ (全探索)\n')
+
+    proc, app = _launch_mt4_session(TESTER_MODEL_FAST)
+    try:
+        evaluator = lambda p: _run_single_test(app, p)
+
+        # ベースライン (ATRフィルターなし) を計算
+        baseline = evaluator(base)
+        log(f'\n[ベースライン (ATRフィルターなし)]  '
+            f'PF={baseline["profit_factor"]:.4f}  '
+            f'純益={baseline["net_profit"]:,.0f}JPY  '
+            f'取引={baseline["total_trades"]}')
+
+        for idx, combo in enumerate(combos, 1):
+            atr_params = dict(zip(keys, combo))
+            params     = {**base, **atr_params}
+
+            data = evaluator(params)
+            results.append(data)
+
+            pf      = data.get('profit_factor', 0) or 0
+            np_     = data.get('net_profit', 0) or 0
+            ntrades = data.get('total_trades', 0)
+            star    = ''
+            if pf > best_pf:
+                best_pf = pf
+                star    = '  ★'
+            log(f'[{idx:2d}/{len(combos)}]'
+                f'  S={atr_params["ATR_Short"]:2d}'
+                f'  B={atr_params["ATR_Baseline"]:3d}'
+                f'  x{atr_params["ATR_Multiplier"]:.1f}'
+                f'  →  PF={pf:.4f}  純益={np_:>8,.0f}JPY'
+                f'  取引={ntrades:3d}{star}')
+    finally:
+        _close_mt4(proc)
+
+    _score_results(results)
+    results.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
+
+    best_r = results[0]
+    log(f'\n=== ATRフィルター最適化完了 ===')
+    log(f'ベースライン比較:')
+    log(f'  Before: PF={baseline["profit_factor"]:.4f}  '
+        f'純益={baseline["net_profit"]:,.0f}JPY  '
+        f'取引={baseline["total_trades"]}')
+    log(f'  After : PF={best_r["profit_factor"]:.4f}  '
+        f'純益={best_r["net_profit"]:,.0f}JPY  '
+        f'取引={best_r["total_trades"]}')
+    print_report(best_r, best_r['params'])
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    best_path.write_text(
+        json.dumps(best_r['params'], ensure_ascii=False, indent=2),
+        encoding='utf-8')
+    log(f'ベストパラメータ保存: {best_path}')
+    save_results(results, 'atr_results')
+
+
+def cmd_ablate():
+    """Leave-one-out アブレーション: best_params.json の各パラメータを 1 つずつ
+    グリッド中央値に戻して再テストし、スコア低下幅からパラメータごとの
+    因果的な寄与度を推定する。
+
+    複数のパラメータが同時に変わる GA の結果だけでは「どの値が効いたか」を
+    切り分けられないため、1 パラメータだけを動かして他は固定する対照実験を行う。
+    """
+    best_path = RESULTS_DIR / 'best_params.json'
+    if not best_path.exists():
+        log('[エラー] best_params.json が見つかりません。先に evolve を実行してください。')
+        sys.exit(1)
+
+    best = json.loads(best_path.read_text(encoding='utf-8'))
+    log(f'ベストパラメータ: {best}')
+
+    proc, app = _launch_mt4_session(TESTER_MODEL_FAST)
+    try:
+        evaluator = lambda p: _run_single_test(app, p)
+
+        baseline = evaluator(best)
+        _score_results([baseline])
+        base_score = baseline['composite_score']
+        log(f'\n[ベースライン(ベストパラメータそのまま)]  '
+            f'スコア={base_score:.4f}  PF={baseline["profit_factor"]:.4f}  '
+            f'純益={baseline["net_profit"]:,.0f}JPY  取引={baseline["total_trades"]}')
+
+        results = []
+        for k in GRID:
+            neutral = GRID[k][len(GRID[k]) // 2]
+            if neutral == best[k]:
+                log(f'[{k}] グリッド中央値とベスト値が同一 ({neutral}) → スキップ')
+                continue
+            trial_params = dict(best)
+            trial_params[k] = neutral
+            data = evaluator(trial_params)
+            _score_results([data])
+            drop = base_score - data['composite_score']
+            data['ablated_param'] = k
+            data['ablated_from']  = best[k]
+            data['ablated_to']    = neutral
+            data['score_drop']    = round(drop, 4)
+            results.append(data)
+            log(f'[{k}]  {best[k]} → {neutral}  '
+                f'スコア={data["composite_score"]:.4f}  低下幅={drop:+.4f}  '
+                f'PF={data["profit_factor"]:.4f}  純益={data["net_profit"]:,.0f}JPY')
+    finally:
+        _close_mt4(proc)
+
+    results.sort(key=lambda x: x['score_drop'], reverse=True)
+
+    log(f'\n=== Leave-one-out アブレーション完了 ===')
+    log('寄与度ランキング（低下幅が大きいほど、そのパラメータの最適化が重要）:')
+    for r in results:
+        log(f'  {r["ablated_param"]:20s}  低下幅={r["score_drop"]:+.4f}')
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_path = RESULTS_DIR / f'ablation_results_{ts}.json'
+    out_path.write_text(
+        json.dumps({'baseline': baseline, 'ablations': results},
+                   ensure_ascii=False, indent=2, default=str),
+        encoding='utf-8')
+    log(f'アブレーション結果保存: {out_path}')
+
+
+# ===== EA 切り替え =====
+
+def _apply_ea_config(key: str):
+    """tools/configs/<key>.json を読み込んでモジュールグローバルに適用する。"""
+    global EA_FILE, TESTER_INI, GRID, _INT_EA_PARAMS, RESULTS_DIR, TESTER_SYMBOL, TESTER_PERIOD
+
+    cfg_path = CONFIGS_DIR / f'{key}.json'
+    if not cfg_path.exists():
+        available = [p.stem for p in sorted(CONFIGS_DIR.glob('*.json'))] \
+                    if CONFIGS_DIR.exists() else []
+        print(f'[エラー] EA 設定ファイルが見つかりません: {cfg_path}\n'
+              f'  利用可能: {", ".join(available) if available else "(なし)"}\n'
+              f'  tools/configs/{key}.json を作成してから再実行してください。')
+        sys.exit(1)
+
+    cfg            = json.loads(cfg_path.read_text(encoding='utf-8'))
+    EA_FILE        = f'{key}.ex4'
+    TESTER_INI     = TESTER_DIR / f'{key}.ini'
+    GRID           = cfg['grid']
+    _INT_EA_PARAMS = set(cfg['int_params'])
+    RESULTS_DIR    = Path(__file__).parent / 'results' / key
+    TESTER_SYMBOL  = cfg.get('symbol', TESTER_SYMBOL)
+    TESTER_PERIOD  = cfg.get('period', TESTER_PERIOD)
+    log(f'EA 設定読み込み: {cfg_path.name}  '
+        f'({len(GRID)} パラメータ / {TESTER_SYMBOL} M{TESTER_PERIOD} / 結果: {RESULTS_DIR})')
+
+
+# ===== コマンド =====
+
+def cmd_grid():
+    keys       = list(GRID.keys())
+    all_combos = list(itertools.product(*[GRID[k] for k in keys]))
+    total      = len(all_combos)
+
+    if MAX_SAMPLES and total > MAX_SAMPLES:
+        log(f'組み合わせ数 {total} → ランダムサンプリング {MAX_SAMPLES} 件')
+        random.seed(42)
+        combos = random.sample(all_combos, MAX_SAMPLES)
+    else:
+        log(f'組み合わせ数: {total}')
+        combos = all_combos
+
+    results = []
+    best_pf = -1.0
+
+    proc, app = _launch_mt4_session(TESTER_MODEL_FAST)
+    try:
+        for idx, combo in enumerate(combos, 1):
+            params = dict(zip(keys, combo))
+            data   = _run_single_test(app, params)
+            results.append(data)
+
+            pf   = data.get('profit_factor', 0) or 0
+            np_  = data.get('net_profit', 0) or 0
+            star = ''
+            if pf > best_pf:
+                best_pf = pf
+                star    = '  ★ 新ベスト'
+            log(f'[{idx:3d}/{len(combos)}] PF={pf:.4f}  純益={np_:>8,.0f}JPY'
+                f'  取引={data["total_trades"]:3d}{star}')
+    finally:
+        _close_mt4(proc)
+
+    _score_results(results)
+    results.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
+
+    log(f'\n=== グリッドサーチ完了 ({len(results)}/{len(combos)} 件) ===')
+    print_report(results[0], results[0]['params'])
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    best_path = RESULTS_DIR / 'best_params.json'
+    best_path.write_text(
+        json.dumps(results[0]['params'], ensure_ascii=False, indent=2),
+        encoding='utf-8')
+    log(f'ベストパラメータ保存: {best_path}')
+    save_results(results, 'grid_results')
+
+
+def cmd_backtest():
+    best_path = RESULTS_DIR / 'best_params.json'
+    if not best_path.exists():
+        log(f'[エラー] {best_path} が見つかりません。先に evolve を実行してください。')
+        sys.exit(1)
+
+    params = json.loads(best_path.read_text(encoding='utf-8'))
+    log(f'パラメータ: {params}')
+
+    data = run_mt4_backtest(params, fast_mode=False)  # Control Points: 精度優先
+    print_report(data, params)
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out = RESULTS_DIR / f'backtest_detail_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+    out.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str),
+                   encoding='utf-8')
+    log(f'詳細結果保存: {out}')
+
+
+# ===== エントリーポイント =====
+
+if __name__ == '__main__':
+    import argparse
+
+    _ops = ['grid', 'evolve', 'refine', 'adaptive', 'atr', 'backtest', 'ablate']
+    parser = argparse.ArgumentParser(
+        description='MT4 EA パラメータ最適化',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            '使用例:\n'
+            '  python mt4_optimizer_2.py -o evolve -k PDX+SAR_0.0.2\n'
+            '  python mt4_optimizer_2.py -o grid   -k PDX+SAR_0.0.2\n'
+            '  利用可能な EA キー: tools/configs/ 内の .json ファイル名 (拡張子なし)'
+        ),
+    )
+    parser.add_argument(
+        '-o', '--operation',
+        default='evolve',
+        choices=_ops,
+        help='実行モード (デフォルト: evolve)',
+    )
+    parser.add_argument(
+        '-k', '--key',
+        default=_DEFAULT_EA_KEY,
+        help=f'EA キー名 (拡張子なし, デフォルト: {_DEFAULT_EA_KEY})',
+    )
+    parser.add_argument(
+        '--symbol',
+        default=None,
+        help='通貨シンボルを上書き (省略時は configs/<key>.json の symbol)',
+    )
+    parser.add_argument(
+        '--period',
+        default=None,
+        choices=list(PERIOD_INDEX_MAP.keys()),
+        help='時間足を分単位で上書き (1,5,15,30,60,240,1440。省略時は configs/<key>.json の period)',
+    )
+    parser.add_argument(
+        '--from-date',
+        dest='from_date',
+        default=None,
+        help='テスト開始日 (YYYY.MM.DD) を上書き',
+    )
+    parser.add_argument(
+        '--to-date',
+        dest='to_date',
+        default=None,
+        help='テスト終了日 (YYYY.MM.DD) を上書き',
+    )
+    args = parser.parse_args()
+
+    _apply_ea_config(args.key)
+
+    # テスト条件の上書き（GUI ランチャー等から個別実行時のみ指定される想定）
+    if args.symbol:
+        TESTER_SYMBOL = args.symbol
+    if args.period:
+        TESTER_PERIOD = args.period
+    if args.from_date:
+        TESTER_FROM = args.from_date
+    if args.to_date:
+        TESTER_TO = args.to_date
+    if args.symbol or args.period or args.from_date or args.to_date:
+        log(f'テスト条件を上書き: symbol={TESTER_SYMBOL}  period={TESTER_PERIOD}  '
+            f'期間={TESTER_FROM} 〜 {TESTER_TO}')
+
+    if not _compile_ea(args.key):
+        log('[エラー] EA のコンパイルに失敗した可能性があります。'
+            'MetaEditor で src/ の .mq4 を開いて手動確認してください。')
+        sys.exit(1)
+
+    if args.operation == 'grid':
+        cmd_grid()
+    elif args.operation == 'evolve':
+        cmd_evolve()
+    elif args.operation == 'refine':
+        cmd_refine()
+    elif args.operation == 'adaptive':
+        cmd_adaptive()
+    elif args.operation == 'atr':
+        cmd_atr()
+    elif args.operation == 'backtest':
+        cmd_backtest()
+    elif args.operation == 'ablate':
+        cmd_ablate()

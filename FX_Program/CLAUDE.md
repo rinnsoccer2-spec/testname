@@ -31,10 +31,14 @@ MQL4ファイルはMetaTrader4内蔵のMetaEditorでコンパイルする（コ�
 4. MT4のNavigatorパネルからEAをチャートにドラッグ＆ドロップして実行
 
 ### Python Tools
+リポジトリルート（`sourcetree`、`.git` がある階層）から実行する。`FX_Program` の中に `cd` する必要はない:
 ```
 pip install selenium
-python tools/pia_retry.py
+python FX_Program\tools\pia_retry.py
+python FX_Program\tools\mt4_optimizer_2.py -o evolve -k PDX+SAR_0.0.2   # MT4最適化 (CLI)
+python FX_Program\tools\optimizer_gui.py                                # MT4最適化ランチャー (GUI)
 ```
+`optimizer_gui.py` は EA (-k) ・操作モード (-o) ・通貨/足/期間を選んで `mt4_optimizer_2.py` を実行するtkinter製ランチャー。詳細は同ファイルのdocstring参照。
 
 ## EA Architecture
 
@@ -146,6 +150,12 @@ Seleniumスクリプト。Piaチケットイベントページを5秒ごとに�
 ## Testing
 
 MQL4ファイルを修正した後は、MetaEditorでのコンパイル結果（エラー・警告の有無）を確認して報告すること。
+
+さらに、EA（.mq4）を変更した場合は毎回、検証用に以下のバックテスト/最適化スクリプトをフルパスで呼び出すコマンドを提示すること（`<EA名>` は変更したEAのキー名に置き換える）:
+
+```
+python C:\Users\rinns\ドキュメント\FX_Program\sourcetree\FX_Program\tools\mt4_optimizer_2.py -o backtest -k <EA名>
+```
 
 ## MT4 Experts ディレクトリアクセスポリシー
 
